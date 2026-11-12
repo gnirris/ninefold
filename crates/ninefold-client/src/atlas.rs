@@ -4,26 +4,30 @@
 //! image. The tiles are 16×16 because that is what 1.8 ships, laid out in a square grid, and
 //! each face of each block gets the rectangle it should sample.
 //!
-//! Two textures are not simply copied in:
+//! Two things are not simply copied in:
 //!
-//! - **grass_top** ships greyscale and is tinted by biome at draw time. Untinted, the world is
-//!   grey, which looks like a renderer bug and is not one.
-//! - **grass_side** is pre-coloured dirt with a transparent-topped overlay, `grass_side_overlay`,
-//!   that carries the green. The two are composited here, overlay tinted, which is what gives a
-//!   grass block its green edge.
+//! - **grass_top** and the leaves ship greyscale and take their colour from the biome. That
+//!   colour is not baked in here: it goes on the vertices, because one atlas tile has to serve a
+//!   grass block in a desert and the same block in a swamp.
+//! - **grass_side** is dirt with a dull fringe, and `grass_side_overlay` is the green part of
+//!   that fringe as a separate cut-out. Vanilla draws the side plain and then lays the tinted
+//!   overlay over it, so both get a tile and the mesher emits two quads.
+//!
+//! The biome colours themselves come out of `colormap/grass.png` and `colormap/foliage.png` —
+//! the same 256×256 lookups the game uses, indexed by the biome's temperature and rainfall.
 
 use std::collections::HashMap;
 
 use ninefold_assets::{AssetSource, Texture};
-use ninefold_mesh::Face;
+use ninefold_mesh::{Face, Shape};
 
-/// Plains biome colours. A proper biome lookup reads these out of the chunk's biome array.
-const GRASS_TINT: [f32; 3] = [
+/// Plains colours, for when the colour maps cannot be read.
+const FALLBACK_GRASS: [f32; 3] = [
     0x91 as f32 / 255.0,
     0xBD as f32 / 255.0,
     0x59 as f32 / 255.0,
 ];
-const FOLIAGE_TINT: [f32; 3] = [
+const FALLBACK_FOLIAGE: [f32; 3] = [
     0x77 as f32 / 255.0,
     0xAB as f32 / 255.0,
     0x2F as f32 / 255.0,
@@ -45,16 +49,23 @@ enum Recipe {
 
 /// Which biome colour a greyscale texture is multiplied by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Tint {
+pub enum Tint {
     Grass,
     Foliage,
 }
 
 impl Tint {
-    const fn colour(self) -> [f32; 3] {
+    const fn fallback(self) -> [f32; 3] {
         match self {
-            Tint::Grass => GRASS_TINT,
-            Tint::Foliage => FOLIAGE_TINT,
+            Tint::Grass => FALLBACK_GRASS,
+            Tint::Foliage => FALLBACK_FOLIAGE,
+        }
+    }
+
+    const fn map(self) -> &'static str {
+        match self {
+            Tint::Grass => "colormap/grass",
+            Tint::Foliage => "colormap/foliage",
         }
     }
 }
@@ -533,32 +544,563 @@ fn blocks() -> Vec<Block> {
             bottom: Recipe::Plain("blocks/ice_packed"),
             side: Recipe::Plain("blocks/ice_packed"),
         },
+        Block {
+            id: 6,
+            meta: None,
+            top: Recipe::Plain("blocks/sapling_oak"),
+            bottom: Recipe::Plain("blocks/sapling_oak"),
+            side: Recipe::Plain("blocks/sapling_oak"),
+        },
+        Block {
+            id: 6,
+            meta: Some(1),
+            top: Recipe::Plain("blocks/sapling_spruce"),
+            bottom: Recipe::Plain("blocks/sapling_spruce"),
+            side: Recipe::Plain("blocks/sapling_spruce"),
+        },
+        Block {
+            id: 6,
+            meta: Some(2),
+            top: Recipe::Plain("blocks/sapling_birch"),
+            bottom: Recipe::Plain("blocks/sapling_birch"),
+            side: Recipe::Plain("blocks/sapling_birch"),
+        },
+        Block {
+            id: 6,
+            meta: Some(3),
+            top: Recipe::Plain("blocks/sapling_jungle"),
+            bottom: Recipe::Plain("blocks/sapling_jungle"),
+            side: Recipe::Plain("blocks/sapling_jungle"),
+        },
+        Block {
+            id: 6,
+            meta: Some(4),
+            top: Recipe::Plain("blocks/sapling_acacia"),
+            bottom: Recipe::Plain("blocks/sapling_acacia"),
+            side: Recipe::Plain("blocks/sapling_acacia"),
+        },
+        Block {
+            id: 6,
+            meta: Some(5),
+            top: Recipe::Plain("blocks/sapling_roofed_oak"),
+            bottom: Recipe::Plain("blocks/sapling_roofed_oak"),
+            side: Recipe::Plain("blocks/sapling_roofed_oak"),
+        },
+        Block {
+            id: 31,
+            meta: None,
+            top: Recipe::Plain("blocks/deadbush"),
+            bottom: Recipe::Plain("blocks/deadbush"),
+            side: Recipe::Plain("blocks/deadbush"),
+        },
+        Block {
+            id: 31,
+            meta: Some(1),
+            top: Recipe::Tinted("blocks/tallgrass", Tint::Grass),
+            bottom: Recipe::Tinted("blocks/tallgrass", Tint::Grass),
+            side: Recipe::Tinted("blocks/tallgrass", Tint::Grass),
+        },
+        Block {
+            id: 31,
+            meta: Some(2),
+            top: Recipe::Tinted("blocks/fern", Tint::Grass),
+            bottom: Recipe::Tinted("blocks/fern", Tint::Grass),
+            side: Recipe::Tinted("blocks/fern", Tint::Grass),
+        },
+        Block {
+            id: 32,
+            meta: None,
+            top: Recipe::Plain("blocks/deadbush"),
+            bottom: Recipe::Plain("blocks/deadbush"),
+            side: Recipe::Plain("blocks/deadbush"),
+        },
+        Block {
+            id: 37,
+            meta: None,
+            top: Recipe::Plain("blocks/flower_dandelion"),
+            bottom: Recipe::Plain("blocks/flower_dandelion"),
+            side: Recipe::Plain("blocks/flower_dandelion"),
+        },
+        Block {
+            id: 38,
+            meta: None,
+            top: Recipe::Plain("blocks/flower_rose"),
+            bottom: Recipe::Plain("blocks/flower_rose"),
+            side: Recipe::Plain("blocks/flower_rose"),
+        },
+        Block {
+            id: 38,
+            meta: Some(1),
+            top: Recipe::Plain("blocks/flower_blue_orchid"),
+            bottom: Recipe::Plain("blocks/flower_blue_orchid"),
+            side: Recipe::Plain("blocks/flower_blue_orchid"),
+        },
+        Block {
+            id: 38,
+            meta: Some(2),
+            top: Recipe::Plain("blocks/flower_allium"),
+            bottom: Recipe::Plain("blocks/flower_allium"),
+            side: Recipe::Plain("blocks/flower_allium"),
+        },
+        Block {
+            id: 38,
+            meta: Some(3),
+            top: Recipe::Plain("blocks/flower_houstonia"),
+            bottom: Recipe::Plain("blocks/flower_houstonia"),
+            side: Recipe::Plain("blocks/flower_houstonia"),
+        },
+        Block {
+            id: 38,
+            meta: Some(4),
+            top: Recipe::Plain("blocks/flower_tulip_red"),
+            bottom: Recipe::Plain("blocks/flower_tulip_red"),
+            side: Recipe::Plain("blocks/flower_tulip_red"),
+        },
+        Block {
+            id: 38,
+            meta: Some(5),
+            top: Recipe::Plain("blocks/flower_tulip_orange"),
+            bottom: Recipe::Plain("blocks/flower_tulip_orange"),
+            side: Recipe::Plain("blocks/flower_tulip_orange"),
+        },
+        Block {
+            id: 38,
+            meta: Some(6),
+            top: Recipe::Plain("blocks/flower_tulip_white"),
+            bottom: Recipe::Plain("blocks/flower_tulip_white"),
+            side: Recipe::Plain("blocks/flower_tulip_white"),
+        },
+        Block {
+            id: 38,
+            meta: Some(7),
+            top: Recipe::Plain("blocks/flower_tulip_pink"),
+            bottom: Recipe::Plain("blocks/flower_tulip_pink"),
+            side: Recipe::Plain("blocks/flower_tulip_pink"),
+        },
+        Block {
+            id: 38,
+            meta: Some(8),
+            top: Recipe::Plain("blocks/flower_oxeye_daisy"),
+            bottom: Recipe::Plain("blocks/flower_oxeye_daisy"),
+            side: Recipe::Plain("blocks/flower_oxeye_daisy"),
+        },
+        Block {
+            id: 39,
+            meta: None,
+            top: Recipe::Plain("blocks/mushroom_brown"),
+            bottom: Recipe::Plain("blocks/mushroom_brown"),
+            side: Recipe::Plain("blocks/mushroom_brown"),
+        },
+        Block {
+            id: 40,
+            meta: None,
+            top: Recipe::Plain("blocks/mushroom_red"),
+            bottom: Recipe::Plain("blocks/mushroom_red"),
+            side: Recipe::Plain("blocks/mushroom_red"),
+        },
+        Block {
+            id: 50,
+            meta: None,
+            top: Recipe::Plain("blocks/torch_on"),
+            bottom: Recipe::Plain("blocks/torch_on"),
+            side: Recipe::Plain("blocks/torch_on"),
+        },
+        Block {
+            id: 59,
+            meta: None,
+            top: Recipe::Plain("blocks/wheat_stage_0"),
+            bottom: Recipe::Plain("blocks/wheat_stage_0"),
+            side: Recipe::Plain("blocks/wheat_stage_0"),
+        },
+        Block {
+            id: 59,
+            meta: Some(1),
+            top: Recipe::Plain("blocks/wheat_stage_1"),
+            bottom: Recipe::Plain("blocks/wheat_stage_1"),
+            side: Recipe::Plain("blocks/wheat_stage_1"),
+        },
+        Block {
+            id: 59,
+            meta: Some(2),
+            top: Recipe::Plain("blocks/wheat_stage_2"),
+            bottom: Recipe::Plain("blocks/wheat_stage_2"),
+            side: Recipe::Plain("blocks/wheat_stage_2"),
+        },
+        Block {
+            id: 59,
+            meta: Some(3),
+            top: Recipe::Plain("blocks/wheat_stage_3"),
+            bottom: Recipe::Plain("blocks/wheat_stage_3"),
+            side: Recipe::Plain("blocks/wheat_stage_3"),
+        },
+        Block {
+            id: 59,
+            meta: Some(4),
+            top: Recipe::Plain("blocks/wheat_stage_4"),
+            bottom: Recipe::Plain("blocks/wheat_stage_4"),
+            side: Recipe::Plain("blocks/wheat_stage_4"),
+        },
+        Block {
+            id: 59,
+            meta: Some(5),
+            top: Recipe::Plain("blocks/wheat_stage_5"),
+            bottom: Recipe::Plain("blocks/wheat_stage_5"),
+            side: Recipe::Plain("blocks/wheat_stage_5"),
+        },
+        Block {
+            id: 59,
+            meta: Some(6),
+            top: Recipe::Plain("blocks/wheat_stage_6"),
+            bottom: Recipe::Plain("blocks/wheat_stage_6"),
+            side: Recipe::Plain("blocks/wheat_stage_6"),
+        },
+        Block {
+            id: 59,
+            meta: Some(7),
+            top: Recipe::Plain("blocks/wheat_stage_7"),
+            bottom: Recipe::Plain("blocks/wheat_stage_7"),
+            side: Recipe::Plain("blocks/wheat_stage_7"),
+        },
+        Block {
+            id: 83,
+            meta: None,
+            top: Recipe::Tinted("blocks/reeds", Tint::Grass),
+            bottom: Recipe::Tinted("blocks/reeds", Tint::Grass),
+            side: Recipe::Tinted("blocks/reeds", Tint::Grass),
+        },
+        Block {
+            id: 104,
+            meta: None,
+            top: Recipe::Plain("blocks/pumpkin_stem_disconnected"),
+            bottom: Recipe::Plain("blocks/pumpkin_stem_disconnected"),
+            side: Recipe::Plain("blocks/pumpkin_stem_disconnected"),
+        },
+        Block {
+            id: 105,
+            meta: None,
+            top: Recipe::Plain("blocks/melon_stem_disconnected"),
+            bottom: Recipe::Plain("blocks/melon_stem_disconnected"),
+            side: Recipe::Plain("blocks/melon_stem_disconnected"),
+        },
+        Block {
+            id: 115,
+            meta: None,
+            top: Recipe::Plain("blocks/nether_wart_stage_2"),
+            bottom: Recipe::Plain("blocks/nether_wart_stage_2"),
+            side: Recipe::Plain("blocks/nether_wart_stage_2"),
+        },
+        Block {
+            id: 141,
+            meta: None,
+            top: Recipe::Plain("blocks/carrots_stage_3"),
+            bottom: Recipe::Plain("blocks/carrots_stage_3"),
+            side: Recipe::Plain("blocks/carrots_stage_3"),
+        },
+        Block {
+            id: 142,
+            meta: None,
+            top: Recipe::Plain("blocks/potatoes_stage_3"),
+            bottom: Recipe::Plain("blocks/potatoes_stage_3"),
+            side: Recipe::Plain("blocks/potatoes_stage_3"),
+        },
+        Block {
+            id: 175,
+            meta: None,
+            top: Recipe::Tinted("blocks/double_plant_grass_top", Tint::Grass),
+            bottom: Recipe::Tinted("blocks/double_plant_grass_top", Tint::Grass),
+            side: Recipe::Tinted("blocks/double_plant_grass_top", Tint::Grass),
+        },
+        Block {
+            id: 175,
+            meta: Some(1),
+            top: Recipe::Plain("blocks/double_plant_syringa_top"),
+            bottom: Recipe::Plain("blocks/double_plant_syringa_top"),
+            side: Recipe::Plain("blocks/double_plant_syringa_top"),
+        },
+        Block {
+            id: 175,
+            meta: Some(4),
+            top: Recipe::Plain("blocks/double_plant_rose_top"),
+            bottom: Recipe::Plain("blocks/double_plant_rose_top"),
+            side: Recipe::Plain("blocks/double_plant_rose_top"),
+        },
+        Block {
+            id: 175,
+            meta: Some(5),
+            top: Recipe::Plain("blocks/double_plant_paeonia_top"),
+            bottom: Recipe::Plain("blocks/double_plant_paeonia_top"),
+            side: Recipe::Plain("blocks/double_plant_paeonia_top"),
+        },
+        Block {
+            id: 19,
+            meta: None,
+            top: Recipe::Plain("blocks/sponge"),
+            bottom: Recipe::Plain("blocks/sponge"),
+            side: Recipe::Plain("blocks/sponge"),
+        },
+        Block {
+            id: 23,
+            meta: None,
+            top: Recipe::Plain("blocks/furnace_side"),
+            bottom: Recipe::Plain("blocks/furnace_side"),
+            side: Recipe::Plain("blocks/furnace_side"),
+        },
+        Block {
+            id: 25,
+            meta: None,
+            top: Recipe::Plain("blocks/noteblock"),
+            bottom: Recipe::Plain("blocks/noteblock"),
+            side: Recipe::Plain("blocks/noteblock"),
+        },
+        Block {
+            id: 43,
+            meta: None,
+            top: Recipe::Plain("blocks/stone_slab_top"),
+            bottom: Recipe::Plain("blocks/stone_slab_top"),
+            side: Recipe::Plain("blocks/stone_slab_top"),
+        },
+        Block {
+            id: 52,
+            meta: None,
+            top: Recipe::Plain("blocks/mob_spawner"),
+            bottom: Recipe::Plain("blocks/mob_spawner"),
+            side: Recipe::Plain("blocks/mob_spawner"),
+        },
+        Block {
+            id: 58,
+            meta: None,
+            top: Recipe::Plain("blocks/crafting_table_top"),
+            bottom: Recipe::Plain("blocks/crafting_table_top"),
+            side: Recipe::Plain("blocks/crafting_table_top"),
+        },
+        Block {
+            id: 61,
+            meta: None,
+            top: Recipe::Plain("blocks/furnace_front_off"),
+            bottom: Recipe::Plain("blocks/furnace_front_off"),
+            side: Recipe::Plain("blocks/furnace_front_off"),
+        },
+        Block {
+            id: 84,
+            meta: None,
+            top: Recipe::Plain("blocks/jukebox_side"),
+            bottom: Recipe::Plain("blocks/jukebox_side"),
+            side: Recipe::Plain("blocks/jukebox_side"),
+        },
+        Block {
+            id: 97,
+            meta: None,
+            top: Recipe::Plain("blocks/stone"),
+            bottom: Recipe::Plain("blocks/stone"),
+            side: Recipe::Plain("blocks/stone"),
+        },
+        Block {
+            id: 103,
+            meta: None,
+            top: Recipe::Plain("blocks/melon_side"),
+            bottom: Recipe::Plain("blocks/melon_side"),
+            side: Recipe::Plain("blocks/melon_side"),
+        },
+        Block {
+            id: 110,
+            meta: None,
+            top: Recipe::Plain("blocks/mycelium_top"),
+            bottom: Recipe::Plain("blocks/mycelium_top"),
+            side: Recipe::Plain("blocks/mycelium_top"),
+        },
+        Block {
+            id: 123,
+            meta: None,
+            top: Recipe::Plain("blocks/redstone_lamp_off"),
+            bottom: Recipe::Plain("blocks/redstone_lamp_off"),
+            side: Recipe::Plain("blocks/redstone_lamp_off"),
+        },
+        Block {
+            id: 133,
+            meta: None,
+            top: Recipe::Plain("blocks/emerald_block"),
+            bottom: Recipe::Plain("blocks/emerald_block"),
+            side: Recipe::Plain("blocks/emerald_block"),
+        },
+        Block {
+            id: 152,
+            meta: None,
+            top: Recipe::Plain("blocks/redstone_block"),
+            bottom: Recipe::Plain("blocks/redstone_block"),
+            side: Recipe::Plain("blocks/redstone_block"),
+        },
+        Block {
+            id: 153,
+            meta: None,
+            top: Recipe::Plain("blocks/quartz_ore"),
+            bottom: Recipe::Plain("blocks/quartz_ore"),
+            side: Recipe::Plain("blocks/quartz_ore"),
+        },
+        Block {
+            id: 165,
+            meta: None,
+            top: Recipe::Plain("blocks/slime"),
+            bottom: Recipe::Plain("blocks/slime"),
+            side: Recipe::Plain("blocks/slime"),
+        },
+        Block {
+            id: 168,
+            meta: None,
+            top: Recipe::Plain("blocks/prismarine_rough"),
+            bottom: Recipe::Plain("blocks/prismarine_rough"),
+            side: Recipe::Plain("blocks/prismarine_rough"),
+        },
+        Block {
+            id: 169,
+            meta: None,
+            top: Recipe::Plain("blocks/sea_lantern"),
+            bottom: Recipe::Plain("blocks/sea_lantern"),
+            side: Recipe::Plain("blocks/sea_lantern"),
+        },
+        Block {
+            id: 170,
+            meta: None,
+            top: Recipe::Plain("blocks/hay_block_side"),
+            bottom: Recipe::Plain("blocks/hay_block_side"),
+            side: Recipe::Plain("blocks/hay_block_side"),
+        },
+        Block {
+            id: 173,
+            meta: None,
+            top: Recipe::Plain("blocks/coal_block"),
+            bottom: Recipe::Plain("blocks/coal_block"),
+            side: Recipe::Plain("blocks/coal_block"),
+        },
+        Block {
+            id: 179,
+            meta: None,
+            top: Recipe::Plain("blocks/red_sandstone_normal"),
+            bottom: Recipe::Plain("blocks/red_sandstone_normal"),
+            side: Recipe::Plain("blocks/red_sandstone_normal"),
+        },
     ]
 }
 
-/// Blocks you can see through, so a face next to one is still worth drawing.
+/// Blocks that fill their cube and hide whatever is behind them.
 ///
-/// Culling against them is what turns a leaf canopy into a checkerboard: leaf textures are full
-/// of holes, so hiding the faces between two leaf blocks lets you see straight through the gaps
-/// into nothing.
-const SEE_THROUGH: [u16; 20] = [
-    0, 6, 8, 9, 18, 20, 26, 30, 31, 32, 37, 38, 39, 40, 65, 79, 101, 102, 106, 161,
+/// Stated this way round on purpose. The list of things that *are* a solid cube is short and
+/// known; the list of things that are not — every stair, slab, fence, pane, plant, torch, rail,
+/// door, carpet and piece of redstone — is long, and anything left off it would wrongly hide the
+/// faces of its neighbours. An unknown id erring towards see-through costs a few extra faces; the
+/// other way round punches holes in the world.
+const OPAQUE: &[u16] = &[
+    1, 2, 3, 4, 5, 7, 12, 13, 14, 15, 16, 17, 19, 21, 22, 23, 24, 25, 29, 33, 35, 41, 42, 43, 45,
+    46, 47, 48, 49, 52, 56, 57, 58, 60, 61, 62, 73, 74, 79, 80, 82, 84, 86, 87, 88, 89, 91, 97,
+    98, 99, 100, 103, 110, 112, 121, 123, 124, 125, 129, 133, 137, 152, 153, 155, 158, 159, 162,
+    168, 169, 170, 172, 173, 174, 179, 181, 201, 202, 206, 213, 214, 215, 216,
 ];
 
-/// Plants are crossed sprites in Minecraft, not cubes, and drawing them as cubes looks worse
-/// than leaving them out. They are skipped until the mesher can do cross-shaped blocks.
-const PLANTS: [u16; 12] = [6, 31, 32, 37, 38, 39, 40, 59, 104, 105, 141, 175];
+/// Blocks drawn as two crossed planes rather than a cube: everything that grows.
+const CROSSED: &[u16] = &[
+    6, 31, 32, 37, 38, 39, 40, 50, 59, 83, 104, 105, 115, 141, 142, 175,
+];
+
+/// Blocks that hide the faces they share with another of themselves.
+///
+/// Water is the one that matters: an ocean is thousands of blocks of it, and without this every
+/// face inside it is meshed, lit and drawn for nobody. Leaves are deliberately *not* here —
+/// hiding the faces between two leaf blocks is what turns a canopy into a checkerboard.
+const SELF_HIDING: &[u16] = &[8, 9, 10, 11, 20, 79, 95, 102, 160, 174];
 
 /// Does this block hide the face of whatever is next to it?
 #[must_use]
 pub fn opaque(block: u16) -> bool {
-    !SEE_THROUGH.contains(&(block >> 4))
+    OPAQUE.contains(&(block >> 4))
 }
 
-/// Should this block be drawn at all yet?
+/// Does `here` hide the face of `against` that looks at it?
+#[must_use]
+pub fn covers(here: u16, against: u16) -> bool {
+    if opaque(here) {
+        return true;
+    }
+    // Two of the same pane of glass, or two of the same water: one surface, not two.
+    here >> 4 == against >> 4 && SELF_HIDING.contains(&(here >> 4))
+}
+
+/// Should this block be drawn at all?
 #[must_use]
 pub fn drawn(block: u16) -> bool {
-    block >> 4 != 0 && !PLANTS.contains(&(block >> 4))
+    !matches!(block >> 4, 0 | 34 | 36)
+}
+
+/// What shape to draw it as.
+#[must_use]
+pub fn shape_of(block: u16) -> Shape {
+    if !drawn(block) {
+        Shape::Invisible
+    } else if CROSSED.contains(&(block >> 4)) {
+        Shape::Cross
+    } else {
+        Shape::Cube
+    }
+}
+
+/// Every 1.8 biome's temperature and rainfall, which is all the colour maps are indexed by.
+///
+/// These are the game's own numbers. The mutated variants of a biome — the "M" ones, ids 128
+/// higher — share their parent's climate, which is why anything above 128 looks itself up again.
+/// Two biomes get colours that are not from the map at all in vanilla: swampland mixes in a
+/// noise-driven murk, and roofed forest darkens what the map gives it. Neither is done here, so a
+/// swamp comes out ordinary green.
+fn climate(biome: u8) -> (f32, f32) {
+    match biome {
+        1 | 16 => (0.8, 0.4),                 // plains, beach
+        2 | 17 | 37 | 38 | 39 => (2.0, 0.0),  // desert and mesa
+        3 | 20 | 25 | 34 => (0.2, 0.3),       // extreme hills
+        4 | 18 | 29 => (0.7, 0.8),            // forest, roofed forest
+        5 | 19 => (0.25, 0.8),                // taiga
+        6 => (0.8, 0.9),                      // swampland
+        8 => (2.0, 0.0),                      // the nether
+        10..=13 => (0.0, 0.5),                // everything frozen
+        14 | 15 => (0.9, 1.0),                // mushroom island
+        21 | 22 => (0.95, 0.9),               // jungle
+        23 => (0.95, 0.8),                    // jungle edge
+        26 => (0.05, 0.3),                    // cold beach
+        27 | 28 => (0.6, 0.6),                // birch forest
+        30 | 31 => (-0.5, 0.4),               // cold taiga
+        32 | 33 => (0.3, 0.8),                // mega taiga
+        35 => (1.2, 0.0),                     // savanna
+        36 => (1.0, 0.0),                     // savanna plateau
+        // A mutated biome has its parent's weather.
+        other if other >= 128 => climate(other - 128),
+        // Ocean, river, and anything this does not know.
+        _ => (0.5, 0.5),
+    }
+}
+
+/// Read one of the game's colour maps into a colour per biome.
+///
+/// Vanilla's own lookup: clamp the biome's temperature and rainfall to 0..1, multiply the
+/// rainfall by the temperature, and read the pixel at `(255 - temperature, 255 - rainfall)`.
+fn biome_colours(assets: &dyn AssetSource, tint: Tint) -> [[f32; 3]; 256] {
+    let mut out = [tint.fallback(); 256];
+    let Some(map) = assets.texture(tint.map()) else {
+        return out;
+    };
+    if map.width < 256 || map.height < 256 {
+        return out;
+    }
+    for (biome, colour) in out.iter_mut().enumerate() {
+        let (temperature, rainfall) = climate(biome as u8);
+        let temperature = temperature.clamp(0.0, 1.0);
+        let rainfall = rainfall.clamp(0.0, 1.0) * temperature;
+        let x = ((1.0 - temperature) * 255.0) as u32;
+        let y = ((1.0 - rainfall) * 255.0) as u32;
+        if let Some(pixel) = map.pixel(x.min(255), y.min(255)) {
+            *colour = [
+                f32::from(pixel[0]) / 255.0,
+                f32::from(pixel[1]) / 255.0,
+                f32::from(pixel[2]) / 255.0,
+            ];
+        }
+    }
+    out
 }
 
 /// The finished atlas, and where everything is in it.
@@ -568,6 +1110,12 @@ pub struct Atlas {
     pub rgba: Vec<u8>,
     /// Left, top, width, height in 0..1, by block id and face.
     rects: HashMap<(u16, Option<u8>, bool, bool), [f32; 4]>,
+    /// Which blocks take a biome colour, and which of the two maps they take it from.
+    tints: HashMap<(u16, Option<u8>), Tint>,
+    /// The tinted cut-out laid over a block's sides: grass, and only grass, in 1.8.
+    overlays: HashMap<(u16, Option<u8>), ([f32; 4], Tint)>,
+    grass: [[f32; 3]; 256],
+    foliage: [[f32; 3]; 256],
     missing: [f32; 4],
 }
 
@@ -576,12 +1124,23 @@ impl Atlas {
     #[must_use]
     pub fn build(assets: &dyn AssetSource) -> Self {
         let blocks = blocks();
-        // One tile per distinct recipe, plus one for anything unknown.
+        // One tile per distinct recipe, plus one for anything unknown. An overlaid face needs
+        // two tiles, not one: the plain side and the cut-out that goes over it.
         let mut order: Vec<Recipe> = Vec::new();
+        let want = |recipe: Recipe, order: &mut Vec<Recipe>| {
+            if !order.contains(&recipe) {
+                order.push(recipe);
+            }
+        };
         for block in &blocks {
             for recipe in [block.top, block.bottom, block.side] {
-                if !order.contains(&recipe) {
-                    order.push(recipe);
+                match recipe {
+                    Recipe::Overlay(base, over, _) => {
+                        want(Recipe::Plain(base), &mut order);
+                        want(Recipe::Plain(over), &mut order);
+                    }
+                    Recipe::Plain(name) => want(Recipe::Plain(name), &mut order),
+                    Recipe::Tinted(name, tint) => want(Recipe::Tinted(name, tint), &mut order),
                 }
             }
         }
@@ -610,14 +1169,35 @@ impl Atlas {
         );
 
         let mut rects = HashMap::new();
+        let mut tints = HashMap::new();
+        let mut overlays = HashMap::new();
         for block in &blocks {
             for (recipe, top, bottom) in [
                 (block.top, true, false),
                 (block.bottom, false, true),
                 (block.side, false, false),
             ] {
-                if let Some(r) = at.get(&recipe) {
-                    rects.insert((block.id, block.meta, top, bottom), *r);
+                let key = (block.id, block.meta, top, bottom);
+                match recipe {
+                    Recipe::Plain(_) => {
+                        if let Some(r) = at.get(&recipe) {
+                            rects.insert(key, *r);
+                        }
+                    }
+                    Recipe::Tinted(_, tint) => {
+                        if let Some(r) = at.get(&recipe) {
+                            rects.insert(key, *r);
+                        }
+                        tints.insert((block.id, block.meta), tint);
+                    }
+                    Recipe::Overlay(base, over, tint) => {
+                        if let Some(r) = at.get(&Recipe::Plain(base)) {
+                            rects.insert(key, *r);
+                        }
+                        if let Some(r) = at.get(&Recipe::Plain(over)) {
+                            overlays.insert((block.id, block.meta), (*r, tint));
+                        }
+                    }
                 }
             }
         }
@@ -626,6 +1206,10 @@ impl Atlas {
             height,
             rgba,
             rects,
+            tints,
+            overlays,
+            grass: biome_colours(assets, Tint::Grass),
+            foliage: biome_colours(assets, Tint::Foliage),
             missing: rect(mx, my, width, height),
         }
     }
@@ -649,6 +1233,42 @@ impl Atlas {
         let [x, y, w, h] = self.rect(block, face);
         [x + uv[0] * w, y + uv[1] * h]
     }
+
+    /// Map a corner onto an arbitrary tile, for the overlay quads.
+    #[must_use]
+    pub fn uv_in(tile: [f32; 4], uv: [f32; 2]) -> [f32; 2] {
+        let [x, y, w, h] = tile;
+        [x + uv[0] * w, y + uv[1] * h]
+    }
+
+    /// Which biome colour this block takes, if any.
+    #[must_use]
+    pub fn tint_of(&self, block: u16) -> Option<Tint> {
+        let (id, meta) = (block >> 4, (block & 0xF) as u8);
+        self.tints
+            .get(&(id, Some(meta)))
+            .or_else(|| self.tints.get(&(id, None)))
+            .copied()
+    }
+
+    /// The tinted cut-out that goes over this block's sides, if it has one.
+    #[must_use]
+    pub fn overlay_of(&self, block: u16) -> Option<([f32; 4], Tint)> {
+        let (id, meta) = (block >> 4, (block & 0xF) as u8);
+        self.overlays
+            .get(&(id, Some(meta)))
+            .or_else(|| self.overlays.get(&(id, None)))
+            .copied()
+    }
+
+    /// What colour a tint is in a given biome.
+    #[must_use]
+    pub fn biome_colour(&self, tint: Tint, biome: u8) -> [f32; 3] {
+        match tint {
+            Tint::Grass => self.grass[biome as usize],
+            Tint::Foliage => self.foliage[biome as usize],
+        }
+    }
 }
 
 fn rect(tx: u32, ty: u32, width: u32, height: u32) -> [f32; 4] {
@@ -661,30 +1281,16 @@ fn rect(tx: u32, ty: u32, width: u32, height: u32) -> [f32; 4] {
 }
 
 /// Produce one tile's pixels.
+///
+/// The tint is deliberately not applied here. A tile is shared by every copy of that block in
+/// the world, and two of them can be in different biomes; the colour belongs on the vertices.
 fn bake(assets: &dyn AssetSource, recipe: Recipe) -> Texture {
-    match recipe {
-        Recipe::Plain(name) => assets
-            .texture(name)
-            .map_or_else(|| Texture::flat(TILE, TILE, [0xCC, 0x44, 0xCC, 0xFF]), crop),
-        Recipe::Tinted(name, tint) => {
-            let mut texture = bake(assets, Recipe::Plain(name));
-            apply_tint(&mut texture, tint.colour());
-            texture
-        }
-        Recipe::Overlay(base, over, tint) => {
-            let mut bottom = bake(assets, Recipe::Plain(base));
-            let mut top = bake(assets, Recipe::Plain(over));
-            apply_tint(&mut top, tint.colour());
-            // Straight over: the overlay's transparent pixels keep the base showing through.
-            let overlay = top.rgba.as_chunks::<4>().0;
-            for (under, above) in bottom.rgba.as_chunks_mut::<4>().0.iter_mut().zip(overlay) {
-                if above[3] >= 8 {
-                    *under = *above;
-                }
-            }
-            bottom
-        }
-    }
+    let name = match recipe {
+        Recipe::Plain(name) | Recipe::Tinted(name, _) | Recipe::Overlay(name, _, _) => name,
+    };
+    assets
+        .texture(name)
+        .map_or_else(|| Texture::flat(TILE, TILE, [0xCC, 0x44, 0xCC, 0xFF]), crop)
 }
 
 /// Animated textures (water, lava) are a column of frames; take the first one.
@@ -702,14 +1308,6 @@ fn crop(texture: Texture) -> Texture {
         width: TILE,
         height: TILE,
         rgba,
-    }
-}
-
-fn apply_tint(texture: &mut Texture, tint: [f32; 3]) {
-    for pixel in texture.rgba.as_chunks_mut::<4>().0 {
-        for (channel, t) in pixel.iter_mut().take(3).zip(tint) {
-            *channel = (f32::from(*channel) * t) as u8;
-        }
     }
 }
 
@@ -760,7 +1358,20 @@ mod tests {
     struct Flat;
     impl AssetSource for Flat {
         fn texture(&self, id: &str) -> Option<Texture> {
-            // grass_top greyscale, so the tint is visible in the result.
+            // The colour maps are big; everything else is a tile.
+            if id.starts_with("colormap/") {
+                let mut map = Texture::flat(256, 256, [0, 0, 0, 255]);
+                // A gradient, so two different climates cannot come out the same colour.
+                for y in 0..256u32 {
+                    for x in 0..256u32 {
+                        let at = ((y * 256 + x) * 4) as usize;
+                        map.rgba[at] = x as u8;
+                        map.rgba[at + 1] = y as u8;
+                        map.rgba[at + 2] = 0x40;
+                    }
+                }
+                return Some(map);
+            }
             let shade = if id.contains("grass_top") { 150 } else { 80 };
             Some(Texture::flat(TILE, TILE, [shade, shade, shade, 255]))
         }
@@ -809,12 +1420,105 @@ mod tests {
     }
 
     #[test]
-    fn the_tint_is_actually_applied() {
+    fn the_blocks_that_need_a_biome_colour_ask_for_one() {
         let atlas = Atlas::build(&Flat);
-        let [x, y, ..] = atlas.rect(2 << 4, Face::Up);
-        let px = (y * atlas.height as f32) as u32 * atlas.width + (x * atlas.width as f32) as u32;
-        let at = (px * 4) as usize;
-        let (r, g, b) = (atlas.rgba[at], atlas.rgba[at + 1], atlas.rgba[at + 2]);
-        assert!(g > r && g > b, "grass should be green, got ({r},{g},{b})");
+        assert_eq!(atlas.tint_of(2 << 4), Some(Tint::Grass), "grass block top");
+        assert_eq!(atlas.tint_of(18 << 4), Some(Tint::Foliage), "oak leaves");
+        assert_eq!(
+            atlas.tint_of((31 << 4) | 1),
+            Some(Tint::Grass),
+            "tall grass"
+        );
+        assert_eq!(atlas.tint_of(1 << 4), None, "stone is just stone");
+        assert_eq!(atlas.tint_of(5 << 4), None, "so are planks");
+    }
+
+    #[test]
+    fn a_grass_block_has_a_tinted_fringe_on_its_sides() {
+        let atlas = Atlas::build(&Flat);
+        let (tile, tint) = atlas.overlay_of(2 << 4).expect("grass side overlay");
+        assert_eq!(tint, Tint::Grass);
+        assert_ne!(
+            tile,
+            atlas.rect(2 << 4, Face::North),
+            "the overlay is its own tile, not the side itself"
+        );
+        assert!(atlas.overlay_of(1 << 4).is_none(), "stone has no fringe");
+    }
+
+    #[test]
+    fn the_colour_map_is_read_and_differs_by_biome() {
+        let atlas = Atlas::build(&Flat);
+        let plains = atlas.biome_colour(Tint::Grass, 1);
+        let desert = atlas.biome_colour(Tint::Grass, 2);
+        let taiga = atlas.biome_colour(Tint::Grass, 5);
+        assert_ne!(plains, desert, "a desert is not a meadow");
+        assert_ne!(plains, taiga);
+        // A mutated biome is its parent's weather, so it is its parent's colour.
+        assert_eq!(
+            atlas.biome_colour(Tint::Grass, 1 + 128),
+            plains,
+            "sunflower plains is plains"
+        );
+    }
+
+    #[test]
+    fn without_a_colour_map_the_plains_colours_are_used() {
+        struct NoMaps;
+        impl AssetSource for NoMaps {
+            fn texture(&self, id: &str) -> Option<Texture> {
+                if id.starts_with("colormap/") {
+                    return None;
+                }
+                Some(Texture::flat(TILE, TILE, [128, 128, 128, 255]))
+            }
+            fn describe(&self) -> String {
+                "test".into()
+            }
+        }
+        let atlas = Atlas::build(&NoMaps);
+        assert_eq!(atlas.biome_colour(Tint::Grass, 4), FALLBACK_GRASS);
+        assert_eq!(atlas.biome_colour(Tint::Foliage, 4), FALLBACK_FOLIAGE);
+    }
+
+    #[test]
+    fn plants_are_crosses_and_stone_is_a_cube() {
+        assert_eq!(shape_of(1 << 4), Shape::Cube);
+        assert_eq!(shape_of(37 << 4), Shape::Cross, "a dandelion");
+        assert_eq!(shape_of((31 << 4) | 1), Shape::Cross, "tall grass");
+        assert_eq!(shape_of(0), Shape::Invisible, "air");
+    }
+
+    #[test]
+    fn only_full_cubes_hide_their_neighbours() {
+        assert!(opaque(1 << 4), "stone");
+        assert!(!opaque(0), "air");
+        assert!(!opaque(44 << 4), "a slab fills half its cube");
+        assert!(!opaque(85 << 4), "a fence");
+        assert!(!opaque(18 << 4), "leaves have holes in them");
+        assert!(!opaque(9999 << 4), "something unknown errs towards visible");
+    }
+
+    #[test]
+    fn water_hides_water_and_leaves_do_not_hide_leaves() {
+        let water = 9 << 4;
+        let leaves = 18 << 4;
+        assert!(covers(water, water), "an ocean is one surface");
+        assert!(
+            !covers(leaves, leaves),
+            "hiding these is what makes a canopy a checkerboard"
+        );
+        assert!(covers(1 << 4, water), "stone hides anything");
+        assert!(!covers(water, 1 << 4), "water does not hide stone");
+        // Flowing water and still water are the same surface as far as this is concerned.
+        assert!(covers((9 << 4) | 3, (9 << 4) | 1));
+    }
+
+    #[test]
+    fn breaking_times_are_the_bare_handed_ones() {
+        assert_eq!(break_seconds(0), 0.0, "air");
+        assert_eq!(break_seconds(2 << 4), 3.0, "a grass block by hand");
+        assert!(break_seconds(7 << 4).is_infinite(), "bedrock");
+        assert!(break_seconds(49 << 4) > 200.0, "obsidian, pointlessly");
     }
 }

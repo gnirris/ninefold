@@ -11,6 +11,8 @@
 
 pub mod blocks;
 pub mod chunk;
+pub mod item;
+pub mod nbt;
 pub mod login;
 pub mod physics;
 pub mod play;
@@ -81,6 +83,10 @@ impl<'a> Reader<'a> {
 
     pub fn i8(&mut self) -> Result<i8> {
         Ok(self.u8()? as i8)
+    }
+
+    pub fn i16(&mut self) -> Result<i16> {
+        Ok(self.u16()? as i16)
     }
 
     pub fn i32(&mut self) -> Result<i32> {
@@ -185,6 +191,15 @@ impl Writer {
     /// Bytes with no length in front, unlike [`Self::bytes`].
     fn bytes_raw(&mut self, value: &[u8]) -> &mut Self {
         self.bytes.extend_from_slice(value);
+        self
+    }
+
+    pub fn i16(&mut self, value: i16) -> &mut Self {
+        self.u16(value as u16)
+    }
+
+    pub fn i32(&mut self, value: i32) -> &mut Self {
+        self.bytes.extend_from_slice(&value.to_be_bytes());
         self
     }
 

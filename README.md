@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain, entity boxes, crosshair, block outline and breaking |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain, biome colour, crossed-sprite plants, mob and player models, the vanilla HUD and menus, inventory, placing, sound |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -117,16 +117,32 @@ cargo run --release -p ninefold-cli    -- join 127.0.0.1:25599 name   # headless
 cargo run --release -p ninefold-client -- 127.0.0.1:25599 name        # with a window
 ```
 
-In the window: WASD to move, space to jump, left control to sprint, left shift to sneak, click to
-take the mouse for looking, escape to give it back. Once the mouse is taken, left click breaks
-the block under the crosshair.
+It starts where the game starts — the title screen, with the logo and the dirt behind it. Press
+enter, or click **Join**, to connect. `--join` after the name skips that and connects straight
+away, which is what a launcher wants.
+
+| | |
+|---|---|
+| WASD, space, left shift, left control | move, jump, sneak, sprint |
+| mouse | look; click the window to take the cursor |
+| left click | break the block under the crosshair — held down, for as long as the block takes |
+| right click | place what is in hand, or use it |
+| 1–9, scroll wheel | pick a hotbar slot |
+| E | inventory |
+| T, / | chat |
+| Q | drop what is in hand |
+| escape | the game menu |
+| F3, F3+B | the readout, and hitboxes |
+
+Breaking is timed against the block's own hardness, because a 1.8 server times the dig itself and
+throws away a "finished" that arrives too early. In creative it is one hit, as it should be.
 
 The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
 so movement is identical at 30 frames a second or 300.
 
 ## The block table
 
-65 entries covering what an overworld is actually made of, keyed by id and optionally by
+Around 130 entries covering what an overworld is actually made of, keyed by id and optionally by
 metadata so wool colours, wood types and stone variants sit on top of a default. Every texture
 name in it was checked against a real 1.8.9 jar rather than typed from memory, and a block with
 no entry draws a loud magenta tile so a gap is obvious instead of invisible. In a forest, 0.0% of
@@ -137,15 +153,78 @@ the screen comes back magenta.
 A draw call samples one texture, so every block face comes out of a single image of 16×16 tiles.
 Two of them are not simply copied in:
 
-- **grass_top** ships greyscale and is tinted by biome at draw time. Untinted, the whole world is
-  grey — which reads as a renderer bug and is not one.
-- **grass_side** is pre-coloured dirt with a separate cut-out, `grass_side_overlay`, carrying the
-  green. They are composited with the overlay tinted, which is where a grass block's green edge
-  comes from.
+- **grass_top** and the leaves ship greyscale and take their colour from the biome. That colour
+  is *not* baked into the tile, because one tile serves a grass block in a desert and the same
+  block in a swamp — it goes on the vertices instead, read out of the game's own
+  `colormap/grass.png` and `colormap/foliage.png` by the biome's temperature and rainfall, which
+  is exactly how vanilla does it.
+- **grass_side** is dirt with a dull fringe, and `grass_side_overlay` is the green part of that
+  fringe as a separate cut-out. Vanilla draws the side plain and lays the tinted overlay over it,
+  so the mesher emits two quads for a grass block's side. Compositing them into one tile would
+  turn the dirt green in a jungle.
 
 Sampling is nearest-neighbour, because 1.8's textures are 16 pixels across and are meant to look
 it, and the fragment shader cuts out below half alpha rather than blending, so leaves and glass
 work without sorting anything back to front.
+
+## What is a cube, and what is not
+
+Almost everything is a cube, which is the only reason a chunk renderer can be fast: a face is
+emitted only where the block next to it does not hide it, which takes a section from 24,576
+faces to a few hundred. Two decisions make that correct rather than merely fast.
+
+**The list is of things that *are* cubes, not things that are not.** Every stair, slab, fence,
+pane, torch, rail, door, carpet and piece of redstone is not a full block, and anything left off
+a list of exceptions would wrongly hide its neighbours' faces. An unknown id erring towards
+visible costs a few extra faces; the other way round punches holes in the world.
+
+**A block decides what hides *it*.** "Can you see through it" and "does it hide the face behind
+it" are different questions. Two leaf blocks are both see-through, and hiding the faces between
+them turns a canopy into a checkerboard you can see sky through. Two water blocks are also both
+see-through, and *not* hiding the faces between them fills an ocean with invisible geometry.
+
+Plants are the exception that cannot be skipped: grass, flowers, saplings, crops and sugar cane
+are two intersecting planes, drawn from both sides because back faces are culled and a flower
+that vanishes when you walk round it is worse than no flower.
+
+## Mobs and players
+
+Every model in 1.8 is a handful of boxes, and each box's six faces take their pixels from one
+unwrapped cross on the mob's texture. The layout is fixed — for a box `w` wide, `h` tall and `d`
+deep placed at `(u, v)`:
+
+```
+       +--------+--------+
+       |  top   | bottom |          d tall
++------+--------+--------+------+
+| left | front  | right  | back |   h tall
++------+--------+--------+------+
+   d       w        d       w
+```
+
+which is why a player's face is always at (8, 8) on a skin. Players, zombies, skeletons,
+creepers, pigs, cows, sheep and chickens have models; anything else is still a box, honestly
+drawn as one.
+
+Nothing animates yet. Legs do not swing and heads turn with the body, because the server does not
+send limb angles — vanilla works them out from how far the entity has moved, and that belongs
+with a proper entity tick. Entities are eased towards where the server last put them rather than
+snapped, because the server speaks twenty times a second at best and everything else in the world
+would stutter even while the player's own movement is smooth.
+
+## Sound
+
+1.8 keeps its sounds in the launcher's asset store rather than the version jar: an index mapping
+`minecraft/sounds/dig/stone1.ogg` to a SHA-1, and a pile of files named after their hash. They
+are read in place, decoded with a pure-Rust Vorbis decoder, and mixed into one stream — panned by
+where the sound is relative to where the player is looking, and quieter the further away it is.
+
+Footsteps come from the block underfoot, every one and two thirds blocks, which is what vanilla's
+own distance counter works out to. Breaking and placing use the block's own material. Everything
+the server asks for by name — a pig, a door, an explosion — is resolved the way vanilla resolves
+it: dots become slashes, and a name with several numbered variants picks between them.
+
+No sound card, or no asset store, gives a silent game rather than no game.
 
 ## Where the artwork comes from
 
@@ -159,6 +238,22 @@ cannot be redistributed. Nothing in the client opens a jar directly — it asks 
 That is the whole plug-and-play story. Installed, you get the game's look; not installed, you
 still get a game. Only the first needs you to own Minecraft, and the client never has to be
 started through the Java launcher — downloading a version is enough.
+
+## The interface
+
+The layout is written in the client; the pixels come out of the player's jar. Vanilla picks a
+whole number for the interface scale so its 16-pixel art never lands between screen pixels, and
+every placement is in those units rather than screen pixels — which is why the hotbar sits in the
+same place at any window size.
+
+The font is measured the way the game measures it: `ascii.png` carries no metrics, so each
+glyph's width is found by scanning its cell from the right until a column has a pixel in it. An
+`i` comes out two pixels wide and an `m` six. That matters for more than looks — the chat box,
+the button labels and the item counts are all positioned by measuring a string.
+
+Items in a slot are drawn two ways, because the game draws them two ways: an item has a flat
+picture of its own in `textures/items`, and a block has none at all and is built as a little cube
+out of its own faces.
 
 ## Mods
 

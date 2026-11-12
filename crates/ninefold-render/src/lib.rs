@@ -1,9 +1,17 @@
 //! A window with the world in it.
 //!
-//! Deliberately the small version: one pipeline, flat-shaded triangles, a camera that sits where
-//! the player is. No texture atlas, no lighting model, no transparency pass. Those are worth
-//! having and none of them can be judged until something is on screen at all, so this is the
-//! thing that gets there.
+//! Four things get drawn, in this order, and the order is the design:
+//!
+//! 1. **The world.** One textured, lit, fogged pipeline, one draw call per chunk column.
+//! 2. **Entities.** The same pipeline and the same vertex format, with the mob sheet bound in
+//!    place of the block atlas — which is the whole reason the vertex format is shared.
+//! 3. **Lines.** Hitboxes and the outline round the block you are looking at.
+//! 4. **The interface.** Screen-space quads, one pass, with the texture swapped between the
+//!    widget sheets, the item sheet, the block atlas (for the blocks drawn in the hotbar) and
+//!    the font.
+//!
+//! Nothing here knows what a block is, what an item is or what a menu looks like. It is handed
+//! triangles and told which picture to put on them.
 
 pub mod camera;
 
@@ -18,8 +26,25 @@ pub struct Vertex {
     pub normal: [f32; 3],
     /// Where in the atlas, already in 0..1 atlas space.
     pub uv: [f32; 2],
+    /// What to multiply the texel by. Grass and leaves ship greyscale and are coloured by the
+    /// biome they are standing in, so this cannot be baked into the atlas.
+    pub tint: [f32; 3],
     /// How lit this corner is, 0..1, straight from the server's light data.
     pub light: f32,
+}
+
+impl Vertex {
+    /// A vertex with no tint, which is almost all of them.
+    #[must_use]
+    pub const fn plain(position: [f32; 3], normal: [f32; 3], uv: [f32; 2], light: f32) -> Self {
+        Self {
+            position,
+            normal,
+            uv,
+            tint: [1.0, 1.0, 1.0],
+            light,
+        }
+    }
 }
 
 #[repr(C)]
@@ -32,6 +57,8 @@ struct Uniforms {
     eye: [f32; 4],
     /// The colour distance fades into — the same as the sky, or the join shows.
     sky: [f32; 4],
+    /// x: how bright the daylight is, 0..1. y: how far the world is drawn.
+    world: [f32; 4],
 }
 
 const SHADER: &str = r"
@@ -40,6 +67,7 @@ struct Uniforms {
     sun: vec4<f32>,
     eye: vec4<f32>,
     sky: vec4<f32>,
+    world: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
@@ -50,6 +78,7 @@ struct Out {
     @location(0) uv: vec2<f32>,
     @location(1) shade: f32,
     @location(2) distance: f32,
+    @location(3) tint: vec3<f32>,
 };
 
 @vertex
@@ -57,18 +86,21 @@ fn vs(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
-    @location(3) light: f32,
+    @location(3) tint: vec3<f32>,
+    @location(4) light: f32,
 ) -> Out {
     var out: Out;
     out.clip = u.view_projection * vec4<f32>(position, 1.0);
     out.uv = uv;
+    out.tint = tint;
     // Two things darken a face: which way it points, and how much light reaches it. The first
     // is only for shape — without it every side of a cube looks identical.
     let facing = max(dot(normalize(normal), normalize(u.sun.xyz)), 0.0);
     let shape = 0.72 + 0.28 * facing;
-    // Never fully black: caves should be gloomy, not invisible.
+    // Never fully black: caves should be gloomy, not invisible. Night dims everything, with a
+    // floor of its own so the world stays readable by moonlight.
     let reached = 0.12 + 0.88 * light;
-    out.shade = shape * reached;
+    out.shade = shape * reached * max(u.world.x, 0.25);
     // The w of a perspective-projected point is its distance along the view axis, so this needs
     // no camera position and cannot be wrong about where the eye is.
     out.distance = out.clip.w;
@@ -85,9 +117,9 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     }
     // Fade into the sky over the last quarter of the view, so chunks arriving at the edge of
     // the world appear out of haze instead of popping into existence.
-    let far = 320.0;
+    let far = u.world.y;
     let fog = clamp((in.distance - far * 0.72) / (far * 0.28), 0.0, 1.0);
-    let lit = texel.rgb * in.shade;
+    let lit = texel.rgb * in.tint * in.shade;
     return vec4<f32>(mix(lit, u.sky.rgb, fog), 1.0);
 }
 ";
@@ -107,6 +139,7 @@ struct Uniforms {
     sun: vec4<f32>,
     eye: vec4<f32>,
     sky: vec4<f32>,
+    world: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -124,7 +157,7 @@ fn vs_world(@location(0) position: vec3<f32>, @location(1) colour: vec4<f32>) ->
     return out;
 }
 
-// On the glass: the crosshair, already in clip space.
+// On the glass: anything already in clip space.
 @vertex
 fn vs_screen(@location(0) position: vec3<f32>, @location(1) colour: vec4<f32>) -> Out {
     var out: Out;
@@ -139,7 +172,7 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
-/// A character of text, in clip space.
+/// A character of text or a piece of interface art, in clip space.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Glyph {
@@ -148,12 +181,11 @@ pub struct Glyph {
     pub colour: [f32; 4],
 }
 
-/// Text, drawn from Minecraft's own `ascii.png`.
+/// Text and interface art, drawn from Minecraft's own sheets.
 ///
-/// That sheet is a 16x16 grid of 8x8 glyphs, white with an alpha cut-out, so the colour comes
-/// from the vertex and the sheet only says which pixels are on. Glyphs are drawn at a fixed
-/// width rather than the variable widths the real font uses: close enough for a debug readout,
-/// and no width table to carry.
+/// `ascii.png` is a 16x16 grid of glyphs, white with an alpha cut-out, so the colour comes from
+/// the vertex; the widget sheets are already coloured, so the vertex colour is left white and
+/// multiplies through to no effect. One shader does both.
 const TEXT_SHADER: &str = r"
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -179,11 +211,9 @@ fn vs(
 @fragment
 fn fs(in: Out) -> @location(0) vec4<f32> {
     let texel = textureSample(font, font_sampler, in.uv);
-    if texel.a < 0.5 {
+    if texel.a < 0.02 {
         discard;
     }
-    // Keep the texture's colour: the font is white so this tints glyphs as before, while the
-    // interface art — hotbar, hearts — keeps the colours it was drawn with.
     return vec4<f32>(texel.rgb * in.colour.rgb, texel.a * in.colour.a);
 }
 ";
@@ -193,7 +223,10 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 const FAR: f32 = 320.0;
 
 /// 1.8's daytime sky, and so the colour the fog fades into.
-const SKY: [f32; 4] = [0.47, 0.65, 1.0, 1.0];
+const SKY: [f32; 3] = [0.47, 0.65, 1.0];
+
+/// One set of buffers with a count of indices.
+type Indexed = (wgpu::Buffer, wgpu::Buffer, u32);
 
 /// Everything needed to draw, tied to one window.
 pub struct Renderer {
@@ -210,16 +243,24 @@ pub struct Renderer {
     depth: wgpu::TextureView,
     /// One set of buffers per chunk column, so a column that changes costs only itself.
     /// Rebuilding the lot for one new chunk is what made this stutter.
-    columns: std::collections::HashMap<(i32, i32), (wgpu::Buffer, wgpu::Buffer, u32)>,
+    columns: std::collections::HashMap<(i32, i32), Indexed>,
     outline: wgpu::RenderPipeline,
     highlight: Option<(wgpu::Buffer, u32)>,
-    entities: Option<(wgpu::Buffer, u32)>,
-    crosshair_mesh: Option<(wgpu::Buffer, u32)>,
+    boxes: Option<(wgpu::Buffer, u32)>,
+    /// Mobs and players: the world pipeline with the mob sheet bound.
+    mobs: Option<wgpu::BindGroup>,
+    mob_mesh: Option<Indexed>,
     text: wgpu::RenderPipeline,
     font: Option<wgpu::BindGroup>,
     text_mesh: Option<(wgpu::Buffer, u32)>,
     gui: Option<wgpu::BindGroup>,
     gui_mesh: Option<(wgpu::Buffer, u32)>,
+    items: Option<wgpu::BindGroup>,
+    item_mesh: Option<(wgpu::Buffer, u32)>,
+    /// Interface quads that sample the block atlas: the blocks drawn in the hotbar.
+    block_icons: Option<(wgpu::Buffer, u32)>,
+    sky: [f32; 3],
+    daylight: f32,
 }
 
 impl Renderer {
@@ -328,7 +369,7 @@ impl Renderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x3, 4 => Float32],
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -452,7 +493,7 @@ impl Renderer {
 
         let depth = depth_view(&device, &config);
 
-        let mut renderer = Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -466,16 +507,20 @@ impl Renderer {
             columns: std::collections::HashMap::new(),
             outline,
             highlight: None,
-            entities: None,
-            crosshair_mesh: None,
+            boxes: None,
+            mobs: None,
+            mob_mesh: None,
             text,
             font: None,
             text_mesh: None,
             gui: None,
             gui_mesh: None,
-        };
-        renderer.build_crosshair();
-        Ok(renderer)
+            items: None,
+            item_mesh: None,
+            block_icons: None,
+            sky: SKY,
+            daylight: 1.0,
+        })
     }
 
     /// Put pixels on the GPU and hand back something to sample from.
@@ -514,11 +559,10 @@ impl Renderer {
         texture.create_view(&wgpu::TextureViewDescriptor::default())
     }
 
-    /// Hand over the texture atlas. Everything drawn afterwards samples from it.
-    pub fn set_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) {
-        let view = self.upload_texture("atlas", width, height, rgba);
-        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("world"),
+    /// One texture plus the shared uniforms, which is the only shape of bind group here.
+    fn bind(&self, label: &str, view: &wgpu::TextureView) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
             layout: &self.layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -527,14 +571,44 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
-        }));
+        })
+    }
+
+    /// Hand over the texture atlas. Everything drawn afterwards samples from it.
+    pub fn set_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("atlas", width, height, rgba);
+        self.bind_group = Some(self.bind("world", &view));
+    }
+
+    /// Hand over the sheet the mob and player models are drawn from.
+    pub fn set_mob_sheet(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("mobs", width, height, rgba);
+        self.mobs = Some(self.bind("mobs", &view));
+    }
+
+    /// Hand over the font sheet. Text can only be drawn once this has been called.
+    pub fn set_font(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("font", width, height, rgba);
+        self.font = Some(self.bind("font", &view));
+    }
+
+    /// Hand over the interface sheets — the hotbar, hearts, menu art and so on.
+    pub fn set_gui_sheets(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("gui", width, height, rgba);
+        self.gui = Some(self.bind("gui", &view));
+    }
+
+    /// Hand over the sheet of item pictures.
+    pub fn set_item_sheet(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("items", width, height, rgba);
+        self.items = Some(self.bind("items", &view));
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -545,7 +619,6 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth = depth_view(&self.device, &self.config);
-        self.build_crosshair();
     }
 
     #[must_use]
@@ -553,40 +626,40 @@ impl Renderer {
         self.config.width as f32 / self.config.height.max(1) as f32
     }
 
+    /// What colour the sky is, and how bright the day is. Night is both darker and bluer.
+    pub fn set_daylight(&mut self, brightness: f32) {
+        self.daylight = brightness.clamp(0.0, 1.0);
+        // Night is not black: 1.8's night sky is a very dark blue, and the fog has to match it
+        // or the horizon shows a seam.
+        let night = [0.02, 0.03, 0.09];
+        let mix = self.daylight.powf(1.5);
+        self.sky = [
+            night[0] + (SKY[0] - night[0]) * mix,
+            night[1] + (SKY[1] - night[1]) * mix,
+            night[2] + (SKY[2] - night[2]) * mix,
+        ];
+    }
+
     /// Give one column its geometry, replacing whatever it had.
     pub fn set_column(&mut self, at: (i32, i32), vertices: &[Vertex], indices: &[u32]) {
-        use wgpu::util::DeviceExt;
-        if indices.is_empty() {
-            self.columns.remove(&at);
-            return;
+        match indexed(&self.device, "column", vertices, indices) {
+            Some(buffers) => {
+                self.columns.insert(at, buffers);
+            }
+            None => {
+                self.columns.remove(&at);
+            }
         }
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("column vertices"),
-                contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("column indices"),
-                contents: bytemuck::cast_slice(indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
-        self.columns.insert(
-            at,
-            (
-                vertex_buffer,
-                index_buffer,
-                u32::try_from(indices.len()).unwrap_or(u32::MAX),
-            ),
-        );
+    }
+
+    /// Every mob and player in one mesh, rebuilt each frame. There are rarely more than a few
+    /// dozen on screen, and they all move, so a per-entity buffer would buy nothing.
+    pub fn set_mobs(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        self.mob_mesh = indexed(&self.device, "mobs", vertices, indices);
     }
 
     /// Outline the block being looked at, or nothing.
     pub fn set_highlight(&mut self, block: Option<(i32, i32, i32)>) {
-        use wgpu::util::DeviceExt;
         let Some((x, y, z)) = block else {
             self.highlight = None;
             return;
@@ -613,148 +686,33 @@ impl Renderer {
                 lines.push(corner(bx, level, bz));
             }
         }
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("highlight"),
-                contents: bytemuck::cast_slice(&lines),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.highlight = Some((buffer, u32::try_from(lines.len()).unwrap_or(0)));
-    }
-
-    /// Hand over the font sheet. Text can only be drawn once this has been called.
-    pub fn set_font(&mut self, width: u32, height: u32, rgba: &[u8]) {
-        let view = self.upload_texture("font", width, height, rgba);
-        self.font = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("font"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        }));
-    }
-
-    /// Hand over the interface sheets — the hotbar, crosshair, hearts and so on.
-    pub fn set_gui_sheets(&mut self, width: u32, height: u32, rgba: &[u8]) {
-        let view = self.upload_texture("gui", width, height, rgba);
-        self.gui = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gui"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        }));
+        self.highlight = vertex_buffer(&self.device, "highlight", &lines);
     }
 
     /// The interface quads for this frame, already in clip space.
     pub fn set_sprites(&mut self, quads: &[Glyph]) {
-        use wgpu::util::DeviceExt;
-        if quads.is_empty() {
-            self.gui_mesh = None;
-            return;
-        }
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("gui"),
-                contents: bytemuck::cast_slice(quads),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.gui_mesh = Some((buffer, u32::try_from(quads.len()).unwrap_or(0)));
+        self.gui_mesh = vertex_buffer(&self.device, "gui", quads);
     }
 
-    /// Lay out lines of text from the top left, in pixels, and keep them for drawing.
-    pub fn set_text(&mut self, lines: &[(String, [f32; 4])]) {
-        use wgpu::util::DeviceExt;
-        /// How many screen pixels one font pixel takes.
-        const SCALE: f32 = 2.0;
-        const GLYPH: f32 = 8.0;
-        const MARGIN: f32 = 6.0;
-
-        if lines.is_empty() {
-            self.text_mesh = None;
-            return;
-        }
-        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-        // Pixels to clip space, with y flipped: text is laid out downwards.
-        let to_clip = |x: f32, y: f32| [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0, 0.0];
-        let cell = GLYPH * SCALE;
-
-        let mut glyphs = Vec::new();
-        for (row, (line, colour)) in lines.iter().enumerate() {
-            let top = MARGIN + row as f32 * (cell + 2.0);
-            for (column, character) in line.chars().enumerate() {
-                let code = if character.is_ascii() {
-                    character as u32
-                } else {
-                    b'?' as u32
-                };
-                if code == 32 {
-                    continue;
-                }
-                let (gx, gy) = ((code % 16) as f32 / 16.0, (code / 16) as f32 / 16.0);
-                let step = 1.0 / 16.0;
-                let left = MARGIN + column as f32 * cell;
-                let corners = [
-                    ([left, top], [gx, gy]),
-                    ([left + cell, top], [gx + step, gy]),
-                    ([left + cell, top + cell], [gx + step, gy + step]),
-                    ([left, top], [gx, gy]),
-                    ([left + cell, top + cell], [gx + step, gy + step]),
-                    ([left, top + cell], [gx, gy + step]),
-                ];
-                for ([px, py], uv) in corners {
-                    glyphs.push(Glyph {
-                        position: to_clip(px, py),
-                        uv,
-                        colour: *colour,
-                    });
-                }
-            }
-        }
-        if glyphs.is_empty() {
-            self.text_mesh = None;
-            return;
-        }
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("text"),
-                contents: bytemuck::cast_slice(&glyphs),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.text_mesh = Some((buffer, u32::try_from(glyphs.len()).unwrap_or(0)));
+    /// Interface quads that sample the item sheet.
+    pub fn set_item_quads(&mut self, quads: &[Glyph]) {
+        self.item_mesh = vertex_buffer(&self.device, "items", quads);
     }
 
-    /// Draw a box round each thing in the world. Crude, but it is the difference between a
-    /// world with other players in it and an empty one; proper models come later.
-    pub fn set_entities(&mut self, boxes: &[([f32; 3], [f32; 3], [f32; 4])]) {
-        use wgpu::util::DeviceExt;
+    /// Interface quads that sample the block atlas, for the blocks drawn in a slot.
+    pub fn set_block_icons(&mut self, quads: &[Glyph]) {
+        self.block_icons = vertex_buffer(&self.device, "block icons", quads);
+    }
+
+    /// The text for this frame, already laid out and in clip space.
+    pub fn set_text_quads(&mut self, quads: &[Glyph]) {
+        self.text_mesh = vertex_buffer(&self.device, "text", quads);
+    }
+
+    /// Draw a box round each thing in the world — what F3+B shows.
+    pub fn set_boxes(&mut self, boxes: &[([f32; 3], [f32; 3], [f32; 4])]) {
         if boxes.is_empty() {
-            self.entities = None;
+            self.boxes = None;
             return;
         }
         let mut lines = Vec::with_capacity(boxes.len() * 24);
@@ -778,42 +736,7 @@ impl Renderer {
                 }
             }
         }
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("entities"),
-                contents: bytemuck::cast_slice(&lines),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.entities = Some((buffer, u32::try_from(lines.len()).unwrap_or(0)));
-    }
-
-    /// Rebuild the crosshair for the current window shape, so it stays square.
-    fn build_crosshair(&mut self) {
-        use wgpu::util::DeviceExt;
-        let aspect = self.aspect();
-        // Nine pixels long, one wide, in clip space.
-        let long = 9.0 / self.config.height as f32;
-        let thin = 1.0 / self.config.height as f32;
-        let colour = [1.0, 1.0, 1.0, 0.8];
-        let quad = |w: f32, h: f32| {
-            let corners = [[-w, -h], [w, -h], [w, h], [-w, -h], [w, h], [-w, h]];
-            corners.map(|[x, y]| Overlay {
-                position: [x, y, 0.0],
-                colour,
-            })
-        };
-        let mut shape = Vec::with_capacity(12);
-        shape.extend(quad(long / aspect, thin));
-        shape.extend(quad(thin / aspect, long));
-        let buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("crosshair"),
-                contents: bytemuck::cast_slice(&shape),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        self.crosshair_mesh = Some((buffer, u32::try_from(shape.len()).unwrap_or(0)));
+        self.boxes = vertex_buffer(&self.device, "boxes", &lines);
     }
 
     /// Forget a column the server has unloaded.
@@ -838,7 +761,8 @@ impl Renderer {
                 // Afternoon sun, slightly off to one side so the faces of a cube differ.
                 sun: [0.4, 0.9, 0.25, 0.0],
                 eye: [eye[0], eye[1], eye[2], FAR],
-                sky: SKY,
+                sky: [self.sky[0], self.sky[1], self.sky[2], 1.0],
+                world: [self.daylight, FAR, 0.0, 0.0],
             }),
         );
 
@@ -868,11 +792,10 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // 1.8's sky blue.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(SKY[0]),
-                            g: f64::from(SKY[1]),
-                            b: f64::from(SKY[2]),
+                            r: f64::from(self.sky[0]),
+                            g: f64::from(self.sky[1]),
+                            b: f64::from(self.sky[2]),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -900,37 +823,89 @@ impl Renderer {
                     pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
-
-                if let Some((lines, count)) = &self.entities {
+            }
+            // Everything alive, out of its own sheet, through the same pipeline.
+            if let (Some((vertices, indices, count)), Some(mobs)) = (&self.mob_mesh, &self.mobs) {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, Some(mobs), &[]);
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+            }
+            if let Some(bind_group) = &self.bind_group {
+                pass.set_bind_group(0, Some(bind_group), &[]);
+                for (buffer, count) in [&self.boxes, &self.highlight].into_iter().flatten() {
                     pass.set_pipeline(&self.outline);
-                    pass.set_vertex_buffer(0, lines.slice(..));
-                    pass.draw(0..*count, 0..1);
-                }
-                if let Some((lines, count)) = &self.highlight {
-                    pass.set_pipeline(&self.outline);
-                    pass.set_vertex_buffer(0, lines.slice(..));
+                    pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
             }
-            // The interface, then the text, both over the world.
-            if let (Some((quads, count)), Some(gui)) = (&self.gui_mesh, &self.gui) {
-                pass.set_pipeline(&self.text);
-                pass.set_bind_group(0, Some(gui), &[]);
-                pass.set_vertex_buffer(0, quads.slice(..));
-                pass.draw(0..*count, 0..1);
-            }
-            // Text last, over everything, with the font bound in place of the block atlas.
-            if let (Some((glyphs, count)), Some(font)) = (&self.text_mesh, &self.font) {
-                pass.set_pipeline(&self.text);
-                pass.set_bind_group(0, Some(font), &[]);
-                pass.set_vertex_buffer(0, glyphs.slice(..));
-                pass.draw(0..*count, 0..1);
+            // The interface, in layers, each with its own picture bound.
+            pass.set_pipeline(&self.text);
+            for (mesh, group) in [
+                (&self.gui_mesh, &self.gui),
+                (&self.block_icons, &self.bind_group),
+                (&self.item_mesh, &self.items),
+                // Text last, over everything.
+                (&self.text_mesh, &self.font),
+            ] {
+                if let (Some((buffer, count)), Some(group)) = (mesh, group) {
+                    pass.set_bind_group(0, Some(group), &[]);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);
         // Presenting moved onto the queue in wgpu 30.
         self.queue.present(frame);
     }
+}
+
+/// A vertex buffer, or `None` for nothing to draw.
+fn vertex_buffer<T: Pod>(
+    device: &wgpu::Device,
+    label: &str,
+    data: &[T],
+) -> Option<(wgpu::Buffer, u32)> {
+    use wgpu::util::DeviceExt;
+    if data.is_empty() {
+        return None;
+    }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    Some((buffer, u32::try_from(data.len()).unwrap_or(u32::MAX)))
+}
+
+/// Vertices and indices together, or `None` for nothing to draw.
+fn indexed(
+    device: &wgpu::Device,
+    label: &str,
+    vertices: &[Vertex],
+    indices: &[u32],
+) -> Option<Indexed> {
+    use wgpu::util::DeviceExt;
+    if indices.is_empty() {
+        return None;
+    }
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(indices),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    Some((
+        vertex_buffer,
+        index_buffer,
+        u32::try_from(indices.len()).unwrap_or(u32::MAX),
+    ))
 }
 
 fn depth_view(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {

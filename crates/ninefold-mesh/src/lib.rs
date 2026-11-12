@@ -10,6 +10,21 @@
 //! into larger quads. Greedy meshing comes later, once there is something on screen to compare
 //! against.
 
+/// What a block is shaped like.
+///
+/// Almost everything is a cube, which is why a chunk renderer can be fast at all. The exception
+/// that cannot be skipped is the crossed sprite: grass, flowers, saplings, crops and dead bushes
+/// are two intersecting planes, and drawn as cubes they are unmistakably wrong — a flower
+/// becomes a solid block of petals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Cube,
+    /// Two planes crossing on the diagonal.
+    Cross,
+    /// There but not drawn.
+    Invisible,
+}
+
 /// Which way a face points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Face {
@@ -71,6 +86,9 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// `id << 4 | metadata`, so the renderer can look up which texture to use.
     pub block: u16,
+    /// Which block this corner belongs to. The position alone cannot say: a corner at x=3 is
+    /// shared by the blocks at 2 and 3, and biome tinting has to know which one it came from.
+    pub at: [i32; 3],
     /// How lit this face is, 0..1, taken from the block in front of it — which is the one the
     /// light actually reaches, not the solid block the face belongs to.
     pub light: f32,
@@ -107,9 +125,25 @@ pub trait Blocks {
         self.block(x, y, z) >> 4 == 0
     }
 
+    /// Does the block here hide the face of `against` that looks at it?
+    ///
+    /// Not the same question as "can you see through it", and the difference is where every
+    /// chunk renderer's worst-looking bug lives. Two leaf blocks are both see-through, and
+    /// hiding the faces between them turns a canopy into a checkerboard you can see the sky
+    /// through. Two water blocks are also both see-through, and *not* hiding the faces between
+    /// them fills an ocean with invisible geometry. Only the block being asked about knows.
+    fn covers(&self, x: i32, y: i32, z: i32, _against: u16) -> bool {
+        !self.see_through(x, y, z)
+    }
+
     /// How bright it is here, 0..15. Flat daylight unless something knows better.
     fn light(&self, _x: i32, _y: i32, _z: i32) -> u8 {
         15
+    }
+
+    /// Cube unless something knows better.
+    fn shape(&self, _x: i32, _y: i32, _z: i32) -> Shape {
+        Shape::Cube
     }
 }
 
@@ -169,10 +203,21 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
                 if block >> 4 == 0 {
                     continue;
                 }
+                match world.shape(x, y, z) {
+                    Shape::Invisible => continue,
+                    Shape::Cross => {
+                        // A sprite is lit by the air it stands in, not by a neighbour: there is
+                        // no face pressed against anything to take the light from.
+                        let light = f32::from(world.light(x, y, z)) / 15.0;
+                        push_cross(&mut mesh, (x, y, z), block, light.max(0.05));
+                        continue;
+                    }
+                    Shape::Cube => {}
+                }
                 for face in Face::ALL {
                     let (nx, ny, nz) = face.offset();
-                    // A face is only worth drawing if you could see through what is next to it.
-                    if world.see_through(x + nx, y + ny, z + nz) {
+                    // A face is only worth drawing if what is next to it does not hide it.
+                    if !world.covers(x + nx, y + ny, z + nz, block) {
                         // Light is sampled in front of the face: inside a solid block it is
                         // always zero, which would make every surface black.
                         let front = (x + nx, y + ny, z + nz);
@@ -252,12 +297,65 @@ fn push_face(
             normal: face.normal(),
             uv,
             block,
+            at: [at.0, at.1, at.2],
             light,
         });
     }
     // Wound so that (v1-v0) x (v2-v0) points the same way as the face does, which is what
     // back-face culling needs. Reverse these and every block is drawn inside out: the world
     // renders, and you are looking at the undersides of it.
+    mesh.indices
+        .extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
+}
+
+/// How far a crossed sprite's planes sit in from the block's edges.
+///
+/// Vanilla's cross model is 14.4 pixels wide across a 16-pixel block, rotated 45 degrees, which
+/// puts its corners a touch inside the block rather than exactly on them.
+const CROSS_INSET: f32 = 0.182;
+
+/// Two crossed planes, each drawn from both sides.
+///
+/// Both sides matter: back faces are culled, so one quad per plane would make a flower vanish
+/// when walked round.
+fn push_cross(mesh: &mut Mesh, at: (i32, i32, i32), block: u16, light: f32) {
+    let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
+    let (lo, hi) = (CROSS_INSET, 1.0 - CROSS_INSET);
+    let (bottom, top) = (y, y + 1.0);
+    let plane = |ax: f32, az: f32, bx: f32, bz: f32| {
+        [
+            [x + ax, bottom, z + az],
+            [x + bx, bottom, z + bz],
+            [x + bx, top, z + bz],
+            [x + ax, top, z + az],
+        ]
+    };
+    for corners in [plane(lo, lo, hi, hi), plane(hi, lo, lo, hi)] {
+        push_quad(mesh, at, corners, block, light);
+        // The same plane the other way round, so it is there from behind as well.
+        let [a, b, c, d] = corners;
+        push_quad(mesh, at, [b, a, d, c], block, light);
+    }
+}
+
+/// One quad, four corners, bottom left first.
+///
+/// Sprites are given an upward normal whatever way they face, because that is how vanilla draws
+/// them: a flower is not shaded darker for facing away from the sun, and all four of a sprite's
+/// quads sample the same texture, so nothing is lost by it.
+fn push_quad(mesh: &mut Mesh, at: (i32, i32, i32), corners: [[f32; 3]; 4], block: u16, light: f32) {
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
+    for (corner, uv) in corners.iter().zip(uvs) {
+        mesh.vertices.push(Vertex {
+            position: *corner,
+            normal: [0.0, 1.0, 0.0],
+            uv,
+            block,
+            at: [at.0, at.1, at.2],
+            light,
+        });
+    }
     mesh.indices
         .extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
 }
@@ -403,6 +501,77 @@ mod tests {
                 "a face pointing {normal:?} is wound towards {wound:?} — it would be culled"
             );
         }
+    }
+
+    #[test]
+    fn a_sprite_is_four_quads_and_stays_inside_its_block() {
+        struct Flower;
+        impl Blocks for Flower {
+            fn block(&self, x: i32, y: i32, z: i32) -> u16 {
+                if (x, y, z) == (2, 3, 4) { 38 << 4 } else { 0 }
+            }
+            fn see_through(&self, _x: i32, _y: i32, _z: i32) -> bool {
+                true
+            }
+            fn shape(&self, x: i32, y: i32, z: i32) -> Shape {
+                if (x, y, z) == (2, 3, 4) {
+                    Shape::Cross
+                } else {
+                    Shape::Cube
+                }
+            }
+        }
+        let mesh = section(&Flower, (0, 0, 0));
+        assert_eq!(mesh.faces(), 4, "two planes, both sides of each");
+        for v in &mesh.vertices {
+            assert!(
+                (2.0..=3.0).contains(&v.position[0]) && (4.0..=5.0).contains(&v.position[2]),
+                "a sprite pokes out of its own block at {:?}",
+                v.position
+            );
+            assert!((3.0..=4.0).contains(&v.position[1]));
+        }
+        // Both facings are present, so it is visible from either side. A sprite's planes stand
+        // upright on the diagonal, so the direction they face is in x and z — checking the y of
+        // the cross product would say nothing at all.
+        let mut forwards = 0;
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let v: Vec<_> = triangle.iter().map(|i| mesh.vertices[*i as usize]).collect();
+            let edge = |a: usize, b: usize| {
+                [
+                    v[a].position[0] - v[b].position[0],
+                    v[a].position[1] - v[b].position[1],
+                    v[a].position[2] - v[b].position[2],
+                ]
+            };
+            let (u, w) = (edge(1, 0), edge(2, 0));
+            let across = u[1] * w[2] - u[2] * w[1];
+            assert!(across.abs() > 1e-6, "a sprite's plane faces nowhere");
+            if across > 0.0 {
+                forwards += 1;
+            }
+        }
+        assert_eq!(
+            forwards, 4,
+            "half the triangles face one way and half the other"
+        );
+    }
+
+    #[test]
+    fn an_invisible_block_makes_nothing() {
+        struct Hidden;
+        impl Blocks for Hidden {
+            fn block(&self, _x: i32, _y: i32, _z: i32) -> u16 {
+                1 << 4
+            }
+            fn see_through(&self, _x: i32, _y: i32, _z: i32) -> bool {
+                true
+            }
+            fn shape(&self, _x: i32, _y: i32, _z: i32) -> Shape {
+                Shape::Invisible
+            }
+        }
+        assert!(section(&Hidden, (0, 0, 0)).is_empty());
     }
 
     #[test]

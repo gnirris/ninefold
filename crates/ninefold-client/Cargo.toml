@@ -15,6 +15,7 @@ ninefold-assets = { path = "../ninefold-assets" }
 ninefold-mesh = { path = "../ninefold-mesh" }
 ninefold-protocol = { path = "../ninefold-protocol" }
 ninefold-render = { path = "../ninefold-render" }
+ninefold-sound = { path = "../ninefold-sound" }
 winit = "0.30.13"
 
 [lints.clippy]

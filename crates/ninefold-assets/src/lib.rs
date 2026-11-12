@@ -10,6 +10,8 @@
 //! [`pick`] chooses between them, which is the whole plug-and-play story: installed, you get the
 //! game's look; not installed, you still get a game.
 
+pub mod sounds;
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
