@@ -44,6 +44,17 @@ const AIR_CONTROL: f64 = 0.02;
 const AIR_CONTROL_SPRINT: f64 = 0.026;
 /// Motion this small is dropped, so a standing player really stops.
 const STOPPED: f64 = 0.005;
+/// In water almost nothing carries over from the tick before, which is why swimming feels like
+/// wading rather than running.
+const WATER_DRAG: f64 = 0.8;
+/// Lava is thicker still.
+const LAVA_DRAG: f64 = 0.5;
+/// You sink slowly rather than falling.
+const FLUID_GRAVITY: f64 = 0.02;
+/// How hard a stroke pushes you along in a liquid.
+const SWIM_PUSH: f64 = 0.02;
+/// Holding jump in water swims upwards.
+const SWIM_UP: f64 = 0.04;
 /// The constant that makes ground acceleration come out at exactly the walk speed:
 /// `0.6 * 0.91` cubed.
 const GROUND_ACCEL: f64 = 0.163_277_136 - 0.000_505_8;
@@ -78,6 +89,11 @@ pub struct Body {
 pub trait World {
     /// Is the block at these coordinates something you cannot walk through?
     fn solid(&self, x: i32, y: i32, z: i32) -> bool;
+
+    /// Is it a liquid, and which? Nothing, unless something knows better.
+    fn fluid(&self, _x: i32, _y: i32, _z: i32) -> crate::blocks::Fluid {
+        crate::blocks::Fluid::None
+    }
 }
 
 /// Nothing anywhere: useful for testing the integrator on its own.
@@ -105,8 +121,51 @@ const WIDTH: f64 = 0.6;
 const HEIGHT: f64 = 1.8;
 
 impl Body {
+    /// Which liquid the player is in, judged at the eyes-down middle of the body as 1.8 does.
+    fn submerged(&self, world: &impl World) -> crate::blocks::Fluid {
+        world.fluid(
+            self.x.floor() as i32,
+            (self.y + 0.4).floor() as i32,
+            self.z.floor() as i32,
+        )
+    }
+
+    /// Advance one tick in a liquid. Nothing carries over, gravity is gentle, and jumping swims.
+    fn tick_in_fluid(&mut self, input: Input, world: &impl World, drag: f64) {
+        let mut forward = input.forward * INPUT;
+        let mut strafe = input.strafe * INPUT;
+        if input.sneak {
+            forward *= SNEAK;
+            strafe *= SNEAK;
+        }
+        let push = forward * forward + strafe * strafe;
+        if push >= 1e-4 {
+            let scale = SWIM_PUSH / push.sqrt().max(1.0);
+            let (forward, strafe) = (forward * scale, strafe * scale);
+            let yaw = input.yaw.to_radians();
+            let (sin, cos) = (yaw.sin(), yaw.cos());
+            self.motion_x += strafe * cos - forward * sin;
+            self.motion_z += forward * cos + strafe * sin;
+        }
+        if input.jump {
+            self.motion_y += SWIM_UP;
+        }
+
+        self.move_by(world);
+
+        self.motion_x *= drag;
+        self.motion_y *= drag;
+        self.motion_z *= drag;
+        self.motion_y -= FLUID_GRAVITY;
+    }
+
     /// Advance one tick.
     pub fn tick(&mut self, input: Input, world: &impl World) {
+        match self.submerged(world) {
+            crate::blocks::Fluid::Water => return self.tick_in_fluid(input, world, WATER_DRAG),
+            crate::blocks::Fluid::Lava => return self.tick_in_fluid(input, world, LAVA_DRAG),
+            crate::blocks::Fluid::None => {}
+        }
         // Last tick's motion decays first — before this tick's input is added. Doing it the other
         // way round makes walking come out at 2.4 blocks/second instead of 4.317.
         let friction = if self.on_ground {
@@ -577,6 +636,81 @@ mod tests {
             body.x > 2.0,
             "sneaking over solid ground still moves: x={}",
             body.x
+        );
+    }
+
+    /// Water from y=0 up to `surface`, with a floor under it.
+    struct Pool {
+        surface: i32,
+    }
+    impl World for Pool {
+        fn solid(&self, _x: i32, y: i32, _z: i32) -> bool {
+            y < 0
+        }
+        fn fluid(&self, _x: i32, y: i32, _z: i32) -> crate::blocks::Fluid {
+            if y < self.surface {
+                crate::blocks::Fluid::Water
+            } else {
+                crate::blocks::Fluid::None
+            }
+        }
+    }
+
+    #[test]
+    fn you_sink_in_water_rather_than_falling() {
+        let pool = Pool { surface: 20 };
+        let mut body = Body {
+            y: 10.0,
+            ..Body::default()
+        };
+        for _ in 0..40 {
+            body.tick(Input::default(), &pool);
+        }
+        // Terminal sink is 0.02 * 0.8 / (1 - 0.8) = 0.08 a tick, nowhere near the 3.92 of air.
+        assert!(
+            body.motion_y > -0.12 && body.motion_y < -0.05,
+            "should sink gently, got {}",
+            body.motion_y
+        );
+    }
+
+    #[test]
+    fn holding_jump_swims_upwards() {
+        let pool = Pool { surface: 20 };
+        let mut body = Body {
+            y: 10.0,
+            ..Body::default()
+        };
+        let swim = Input {
+            jump: true,
+            ..Input::default()
+        };
+        for _ in 0..40 {
+            body.tick(swim, &pool);
+        }
+        assert!(body.y > 10.0, "should have risen, y={}", body.y);
+    }
+
+    #[test]
+    fn swimming_is_slower_than_walking() {
+        let pool = Pool { surface: 20 };
+        let mut body = Body {
+            y: 10.0,
+            ..Body::default()
+        };
+        for _ in 0..60 {
+            body.tick(
+                Input {
+                    forward: 1.0,
+                    ..Input::default()
+                },
+                &pool,
+            );
+        }
+        let speed = body.speed();
+        assert!(
+            speed > 0.5 && speed < 3.0,
+            "swimming is a wade, got {speed} b/s"
         );
     }
 

@@ -725,6 +725,34 @@ fn blit(atlas: &mut [u8], atlas_width: u32, x: u32, y: u32, tile: &Texture) {
     }
 }
 
+/// How long a block takes to break by hand, in seconds, on a 1.8 server.
+///
+/// Vanilla works it out from the block's hardness: without a tool that helps, breaking takes
+/// `hardness * 5` seconds, and `hardness * 1.5` when the tool is right for the job. These are
+/// the bare-hand times, which is what this client has until it has an inventory.
+///
+/// It matters because the server times the dig itself and throws away a "finished" that arrives
+/// too early — which is exactly why sending start and finish together broke nothing at all.
+#[must_use]
+pub fn break_seconds(block: u16) -> f32 {
+    let hardness = match block >> 4 {
+        // Instant.
+        0 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 175 => 0.0,
+        78 => 0.1,                                     // snow layer
+        18 | 161 => 0.2,                               // leaves
+        2 | 3 | 12 | 13 | 60 => 0.6,                   // grass, dirt, sand, gravel, farmland
+        79 | 174 => 0.5,                               // ice
+        17 | 162 | 5 | 47 | 85 => 2.0,                 // wood
+        1 | 4 | 48 | 98 | 24 | 45 => 2.0,              // stone and its kin
+        14 | 15 | 16 | 21 | 56 | 73 | 74 | 129 => 3.0, // ores
+        41 | 42 | 57 | 22 => 5.0,                      // metal and gem blocks
+        49 => 50.0,                                    // obsidian
+        7 => f32::INFINITY,                            // bedrock
+        _ => 1.0,
+    };
+    if hardness == 0.0 { 0.0 } else { hardness * 5.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

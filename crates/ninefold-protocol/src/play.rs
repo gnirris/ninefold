@@ -36,6 +36,7 @@ const ENTITY_TELEPORT: i32 = 0x18;
 const OUT_KEEP_ALIVE: i32 = 0x00;
 const OUT_DIG: i32 = 0x07;
 const OUT_SWING: i32 = 0x0A;
+const OUT_CLIENT_STATUS: i32 = 0x16;
 const OUT_POSITION_AND_LOOK: i32 = 0x06;
 
 /// Something in the world that is not the player.
@@ -129,6 +130,8 @@ pub struct Session {
     pub food: u8,
     /// Which hotbar slot is in hand, 0..8.
     pub held: u8,
+    /// Health has run out, and the server is waiting to be asked for a respawn.
+    pub dead: bool,
 }
 
 impl Session {
@@ -147,6 +150,7 @@ impl Session {
             health: 20.0,
             food: 20,
             held: 0,
+            dead: false,
         }
     }
 
@@ -228,6 +232,9 @@ impl Session {
                 let mut r = Reader::new(&payload);
                 self.health = r.f32().map_err(bad)?;
                 self.food = u8::try_from(r.var_int().map_err(bad)?.clamp(0, 20)).unwrap_or(20);
+                if self.health <= 0.0 {
+                    self.dead = true;
+                }
             }
             HELD_SLOT => {
                 let slot = Reader::new(&payload).u8().map_err(bad)?;
@@ -398,21 +405,43 @@ impl Session {
         ))
     }
 
-    /// Break the block being looked at.
+    /// Tell the server digging has started.
     ///
-    /// Two packets: started, then finished. A creative-mode server takes the block out at once;
-    /// in survival it times the dig and will ignore a finish that came too soon.
-    pub fn dig(&mut self, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
+    /// A 1.8 server times the dig itself against the block's hardness and throws away a
+    /// "finished" that arrives too early — so these are three separate things, not one.
+    pub fn dig_start(&mut self, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
+        self.dig_packet(0, x, y, z, side)
+    }
+
+    /// Stop without breaking it.
+    pub fn dig_cancel(&mut self, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
+        self.dig_packet(1, x, y, z, side)
+    }
+
+    /// The block has had its time: take it out.
+    pub fn dig_finish(&mut self, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
+        self.dig_packet(2, x, y, z, side)
+    }
+
+    fn dig_packet(&mut self, status: u8, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
         let at = encode_position(x, y, z);
-        for status in [0u8, 2] {
-            self.connection.send(
-                OUT_DIG,
-                &body(|w: &mut Writer| {
-                    w.u8(status).i64(at).u8(side);
-                }),
-            )?;
-        }
-        self.swing()
+        self.connection.send(
+            OUT_DIG,
+            &body(|w: &mut Writer| {
+                w.u8(status).i64(at).u8(side);
+            }),
+        )
+    }
+
+    /// Come back to life where the server puts you.
+    pub fn respawn(&mut self) -> io::Result<()> {
+        self.dead = false;
+        self.connection.send(
+            OUT_CLIENT_STATUS,
+            &body(|w: &mut Writer| {
+                w.var_int(0);
+            }),
+        )
     }
 
     /// Swing the arm, so other players see something happen.
@@ -485,7 +514,12 @@ impl Session {
 /// flowers and grass; a proper block table comes with the renderer.
 impl crate::physics::World for Session {
     fn solid(&self, x: i32, y: i32, z: i32) -> bool {
-        self.block_at(x, y, z).is_some_and(|block| block >> 4 != 0)
+        self.block_at(x, y, z).is_some_and(crate::blocks::solid)
+    }
+
+    fn fluid(&self, x: i32, y: i32, z: i32) -> crate::blocks::Fluid {
+        self.block_at(x, y, z)
+            .map_or(crate::blocks::Fluid::None, crate::blocks::fluid)
     }
 }
 

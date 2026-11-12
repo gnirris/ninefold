@@ -106,6 +106,11 @@ struct App {
     debug: bool,
     /// Hitboxes, as F3+B does.
     hitboxes: bool,
+    /// The block being broken, how long it still needs, and whether the server has been told
+    /// that digging started.
+    breaking: Option<(raycast::Hit, f32)>,
+    /// Is the left button down?
+    swinging: bool,
 }
 
 #[derive(Default)]
@@ -156,6 +161,8 @@ impl App {
             screen: (1280, 720),
             debug: false,
             hitboxes: false,
+            breaking: None,
+            swinging: false,
         }
     }
 
@@ -205,8 +212,62 @@ impl App {
         }
     }
 
+    /// Keep breaking whatever is under the crosshair, if the button is down.
+    ///
+    /// A 1.8 server times the dig itself and ignores a "finished" that comes too soon, so this
+    /// has to wait out the block's own break time rather than firing both packets at once.
+    fn tick_breaking(&mut self) {
+        let Some(hit) = self.aimed.filter(|_| self.swinging) else {
+            // Nothing aimed at, or the button is up.
+            if let Some((hit, _)) = self.breaking.take() {
+                let _ = self.session.dig_cancel(hit.x, hit.y, hit.z, hit.side as u8);
+            }
+            return;
+        };
+
+        // Looking at something else now: start again on the new block.
+        if self
+            .breaking
+            .is_none_or(|(old, _)| (old.x, old.y, old.z) != (hit.x, hit.y, hit.z))
+        {
+            if let Some((old, _)) = self.breaking.take() {
+                let _ = self.session.dig_cancel(old.x, old.y, old.z, old.side as u8);
+            }
+            let block = self.session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
+            let needs = atlas::break_seconds(block);
+            if let Err(e) = self.session.dig_start(hit.x, hit.y, hit.z, hit.side as u8) {
+                eprintln!("could not start digging: {e}");
+                return;
+            }
+            self.breaking = Some((hit, needs));
+        }
+
+        let Some((hit, left)) = &mut self.breaking else {
+            return;
+        };
+        *left -= 1.0 / TPS as f32;
+        if *left > 0.0 {
+            let _ = self.session.swing();
+            return;
+        }
+        // Done: tell the server, and take it out here too rather than waiting to be told what
+        // we already know.
+        let (x, y, z, side) = (hit.x, hit.y, hit.z, hit.side as u8);
+        self.breaking = None;
+        if let Err(e) = self.session.dig_finish(x, y, z, side) {
+            eprintln!("could not finish digging: {e}");
+            return;
+        }
+        self.session.set_block(x, y, z, 0);
+    }
+
     fn tick_physics(&mut self) {
         self.previous = [self.body.x, self.body.y, self.body.z];
+        if self.session.dead {
+            // Nothing to send and nothing to move: the server is waiting to be asked for a
+            // respawn, and anything else it would ignore.
+            return;
+        }
         let input = Input {
             forward: f64::from(i8::from(self.held.forward) - i8::from(self.held.back)),
             strafe: f64::from(i8::from(self.held.left) - i8::from(self.held.right)),
@@ -273,20 +334,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed && self.looking {
-                    // Looking already: a click is a swing at whatever is under the crosshair.
-                    if button == winit::event::MouseButton::Left
-                        && let Some(hit) = self.aimed
-                    {
-                        if let Err(e) = self.session.dig(hit.x, hit.y, hit.z, hit.side as u8) {
-                            eprintln!("could not dig: {e}");
-                        } else {
-                            // Take it out locally too, rather than waiting for the server to
-                            // tell us what we already know.
-                            self.session.set_block(hit.x, hit.y, hit.z, 0);
+                if button == winit::event::MouseButton::Left && self.looking {
+                    self.swinging = state == ElementState::Pressed;
+                    if !self.swinging {
+                        // Let go: tell the server to forget the dig in progress.
+                        if let Some((hit, _)) = self.breaking.take()
+                            && let Err(e) =
+                                self.session.dig_cancel(hit.x, hit.y, hit.z, hit.side as u8)
+                        {
+                            eprintln!("could not stop digging: {e}");
                         }
-                    } else if let Err(e) = self.session.swing() {
-                        eprintln!("could not swing: {e}");
                     }
                 }
                 if state == ElementState::Pressed
@@ -307,6 +364,14 @@ impl ApplicationHandler for App {
                 let down = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
+                        // Before the plain Space arm, or the guard never gets a look in.
+                        KeyCode::Space if down && self.session.dead => {
+                            if let Err(e) = self.session.respawn() {
+                                eprintln!("could not respawn: {e}");
+                            } else {
+                                self.body.motion_y = 0.0;
+                            }
+                        }
                         KeyCode::KeyW => self.held.forward = down,
                         KeyCode::KeyS => self.held.back = down,
                         KeyCode::KeyA => self.held.left = down,
@@ -345,6 +410,7 @@ impl ApplicationHandler for App {
                 while self.owed >= tick {
                     self.owed -= tick;
                     self.tick_physics();
+                    self.tick_breaking();
                 }
 
                 {
@@ -431,6 +497,10 @@ impl ApplicationHandler for App {
                             ),
                         ]
                     };
+                    if self.session.dead {
+                        lines.push(("You died!".to_owned(), [1.0, 0.35, 0.35, 1.0]));
+                        lines.push(("Press space to respawn".to_owned(), white));
+                    }
                     // The last few things said, oldest first, under the readout.
                     let said = self.session.chat.len().saturating_sub(5);
                     for line in &self.session.chat[said..] {

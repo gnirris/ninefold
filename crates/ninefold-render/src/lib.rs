@@ -212,7 +212,6 @@ pub struct Renderer {
     /// Rebuilding the lot for one new chunk is what made this stutter.
     columns: std::collections::HashMap<(i32, i32), (wgpu::Buffer, wgpu::Buffer, u32)>,
     outline: wgpu::RenderPipeline,
-    crosshair: wgpu::RenderPipeline,
     highlight: Option<(wgpu::Buffer, u32)>,
     entities: Option<(wgpu::Buffer, u32)>,
     crosshair_mesh: Option<(wgpu::Buffer, u32)>,
@@ -410,7 +409,6 @@ impl Renderer {
             })
         };
         let outline = overlay_pipeline("vs_world", wgpu::PrimitiveTopology::LineList, true);
-        let crosshair = overlay_pipeline("vs_screen", wgpu::PrimitiveTopology::TriangleList, false);
 
         let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("text"),
@@ -467,7 +465,6 @@ impl Renderer {
             depth,
             columns: std::collections::HashMap::new(),
             outline,
-            crosshair,
             highlight: None,
             entities: None,
             crosshair_mesh: None,
