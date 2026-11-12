@@ -132,19 +132,67 @@ fn join(target: &str, name: &str) -> ExitCode {
         }
     }
 
-    for _ in 0..10 {
-        if let Err(e) = session.walk(0.5, 0.0) {
-            eprintln!("walking failed: {e}");
+    // Now walk with the real physics, a tick at a time, and see whether the server agrees.
+    use ninefold_protocol::physics::{Body, Input, TPS};
+    let mut body = Body {
+        x: start.x,
+        y: start.y,
+        z: start.z,
+        on_ground: true,
+        ..Body::default()
+    };
+    let input = Input {
+        forward: 1.0,
+        sprint: true,
+        yaw: -90.0, // due east
+        ..Input::default()
+    };
+    let ticks = 60;
+    let tick = Duration::from_secs_f64(1.0 / TPS);
+    let began = std::time::Instant::now();
+    for n in 0..ticks {
+        body.tick(input, &session);
+        session.position.x = body.x;
+        session.position.y = body.y;
+        session.position.z = body.z;
+        session.position.on_ground = body.on_ground;
+        if let Err(e) = session.send_position() {
+            eprintln!("dropped on tick {n}: {e}");
             return ExitCode::FAILURE;
         }
-        if let Err(e) = session.step() {
-            eprintln!("dropped while walking: {e}");
+        if let Err(e) = session.pump() {
+            eprintln!("dropped on tick {n}: {e}");
             return ExitCode::FAILURE;
         }
+        std::thread::sleep(tick.saturating_sub(began.elapsed() / (n + 1).max(1)));
     }
-    let moved = session.position.x - start.x;
-    println!("walked {moved:.2} blocks east, still connected");
-    println!("keep-alives answered: {}", session.keep_alives);
+
+    let travelled = ((body.x - start.x).powi(2) + (body.z - start.z).powi(2)).sqrt();
+    let seconds = f64::from(ticks) / TPS;
+    println!(
+        "sprinted {travelled:.2} blocks in {seconds:.1}s = {:.3} blocks/second",
+        travelled / seconds
+    );
+    println!(
+        "  speed now {:.3} b/s, on ground {}",
+        body.speed(),
+        body.on_ground
+    );
+    println!(
+        "  server has us at x={:.2} z={:.2}",
+        session.position.x, session.position.z
+    );
+    println!("  keep-alives answered: {}", session.keep_alives);
+
+    // If the server disagreed it would have teleported us back, and `position` would no longer
+    // be where the physics put us.
+    let drift =
+        ((session.position.x - body.x).powi(2) + (session.position.z - body.z).powi(2)).sqrt();
+    if drift > 0.01 {
+        println!("  the server corrected us by {drift:.2} blocks: it rejected the movement");
+        return ExitCode::FAILURE;
+    }
+    println!("  the server accepted every step");
     ExitCode::SUCCESS
 }
 

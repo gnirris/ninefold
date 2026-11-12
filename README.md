@@ -36,7 +36,7 @@ multi-year target, built in order of what can be proved:
 | Phase | | State |
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
-| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **in progress** — joins, decodes the world, walks; physics next |
+| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
 | 3 | Rendering: terrain meshing, entities, HUD | |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
@@ -73,6 +73,35 @@ The server agrees, which is the part that counts:
 ```
 ninefold[/127.0.0.1:36038] logged in with entity id 0 at (1015.5, 4.0, 590.5)
 ninefold joined the game
+```
+
+## The movement
+
+The 1.8 feel is the reason this targets 1.8.9 at all, so the constants are checked against the
+numbers the game is known for rather than against anything the code decided:
+
+| | |
+|---|---|
+| walking | 4.317 blocks/second |
+| sprinting | 5.612 blocks/second |
+| jump apex | 1.2522 blocks |
+| terminal fall | 3.92 blocks/tick |
+
+The order inside a tick matters as much as the constants: friction applies to the motion carried
+in from last tick *before* this tick's input is added, and gravity applies *after* the position
+has moved. Swap either and the numbers above come out wrong.
+
+Diagonal movement is about 2% faster, and that is correct — `moveFlying` only scales input down
+when its magnitude is over 1, so a straight line keeps the 0.98 a held key gives while a diagonal
+(1.386) is normalised to 1.0. The same 0.98 is what puts walking at 4.317, so "fixing" one breaks
+the other.
+
+Driven against a real server, the physics is accepted without a single correction:
+
+```
+sprinted 16.50 blocks in 3.0s = 5.500 blocks/second
+  speed now 5.612 b/s, on ground true
+  the server accepted every step
 ```
 
 ## Mods

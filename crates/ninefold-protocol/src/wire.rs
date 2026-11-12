@@ -64,6 +64,11 @@ impl Connection {
     }
 
     /// Write bytes that are already framed (the handshake builds its own).
+    /// How long a read waits before giving up. Short while ticking, so the loop keeps time.
+    pub fn set_read_timeout(&mut self, how_long: Option<Duration>) -> io::Result<()> {
+        self.stream.set_read_timeout(how_long)
+    }
+
     pub fn send_raw(&mut self, packet: &[u8]) -> io::Result<()> {
         self.stream.write_all(packet)?;
         self.stream.flush()

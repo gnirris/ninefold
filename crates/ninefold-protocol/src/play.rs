@@ -211,6 +211,42 @@ impl Session {
     }
 }
 
+/// The decoded world, as something the physics can walk on.
+///
+/// Anything that is not air counts as solid, which is right for a flat world and wrong for
+/// flowers and grass; a proper block table comes with the renderer.
+impl crate::physics::World for Session {
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        self.block_at(x, y, z).is_some_and(|block| block >> 4 != 0)
+    }
+}
+
+impl Session {
+    /// Read whatever has already arrived, and stop as soon as nothing has. Keeps the tick loop
+    /// to time instead of blocking on the next packet.
+    pub fn pump(&mut self) -> io::Result<()> {
+        self.connection
+            .set_read_timeout(Some(Duration::from_millis(1)))?;
+        let outcome = loop {
+            match self.step() {
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break Ok(());
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        self.connection
+            .set_read_timeout(Some(Duration::from_secs(10)))?;
+        outcome
+    }
+}
+
 /// Read the Join Game that always comes first in the play state.
 pub fn read_join(connection: &mut Connection) -> io::Result<Joined> {
     loop {
