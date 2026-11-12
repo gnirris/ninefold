@@ -1,0 +1,14 @@
+[package]
+name = "ninefold-cli"
+description = "Command line front end for ninefold"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ninefold"
+path = "src/main.rs"
+
+[dependencies]
+ninefold-protocol = { path = "../ninefold-protocol" }

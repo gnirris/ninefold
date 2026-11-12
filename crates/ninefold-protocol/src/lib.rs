@@ -9,6 +9,9 @@
 //! an ID and four bits of metadata packed into a `u16`, not a block state; chunks are sent as
 //! fixed arrays, not a palette. Nothing here can be shared with a 1.13+ implementation.
 
+pub mod status;
+pub mod wire;
+
 /// Protocol version 1.8–1.8.9 servers expect in a handshake.
 pub const PROTOCOL_VERSION: i32 = 47;
 
