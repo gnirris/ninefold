@@ -1,0 +1,12 @@
+[package]
+name = "ninefold-protocol"
+description = "Minecraft Java Edition 1.8.9 wire protocol (version 47)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+all = "deny"
