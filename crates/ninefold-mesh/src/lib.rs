@@ -44,6 +44,16 @@ impl Face {
         }
     }
 
+    /// Two directions across the face, used to find the blocks meeting at each corner.
+    #[must_use]
+    pub const fn corner_axes(self) -> ((i32, i32, i32), (i32, i32, i32)) {
+        match self {
+            Face::Down | Face::Up => ((1, 0, 0), (0, 0, 1)),
+            Face::North | Face::South => ((1, 0, 0), (0, 1, 0)),
+            Face::West | Face::East => ((0, 0, 1), (0, 1, 0)),
+        }
+    }
+
     /// Unit normal, for lighting.
     #[must_use]
     pub const fn normal(self) -> [f32; 3] {
@@ -103,6 +113,49 @@ pub trait Blocks {
     }
 }
 
+/// The four blocks that meet at one corner of a face, on the lit side.
+///
+/// Minecraft's smooth lighting averages those four, and darkens the corner where they are
+/// solid — which is what gives terrain its soft shading in the crevices. Flat per-face light
+/// makes a cave look like a box of identical grey walls.
+fn corner_light(
+    world: &impl Blocks,
+    front: (i32, i32, i32),
+    along: (i32, i32, i32),
+    across: (i32, i32, i32),
+) -> f32 {
+    let at = |(x, y, z): (i32, i32, i32)| (x, y, z);
+    let side_a = at((front.0 + along.0, front.1 + along.1, front.2 + along.2));
+    let side_b = at((front.0 + across.0, front.1 + across.1, front.2 + across.2));
+    let diagonal = at((
+        front.0 + along.0 + across.0,
+        front.1 + along.1 + across.1,
+        front.2 + along.2 + across.2,
+    ));
+
+    let solid = |(x, y, z): (i32, i32, i32)| !world.see_through(x, y, z);
+    let light = |(x, y, z): (i32, i32, i32)| f32::from(world.light(x, y, z)) / 15.0;
+
+    // Two solid sides close the corner off: the diagonal cannot contribute, however bright it
+    // is, because no light reaches round two walls.
+    let blocked = if solid(side_a) && solid(side_b) {
+        3.0
+    } else {
+        f32::from(solid(side_a)) + f32::from(solid(side_b)) + f32::from(solid(diagonal))
+    };
+    let mut total = light(front);
+    let mut counted = 1.0;
+    for neighbour in [side_a, side_b, diagonal] {
+        if !solid(neighbour) {
+            total += light(neighbour);
+            counted += 1.0;
+        }
+    }
+    let average = total / counted;
+    // Ambient occlusion: a corner with things crowding it is darker.
+    average * (1.0 - 0.22 * blocked / 3.0)
+}
+
 /// Build the geometry for the 16×16×16 section whose corner is at `origin`.
 #[must_use]
 pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
@@ -122,8 +175,15 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
                     if world.see_through(x + nx, y + ny, z + nz) {
                         // Light is sampled in front of the face: inside a solid block it is
                         // always zero, which would make every surface black.
-                        let light = f32::from(world.light(x + nx, y + ny, z + nz)) / 15.0;
-                        push_face(&mut mesh, (x, y, z), face, block, light);
+                        let front = (x + nx, y + ny, z + nz);
+                        let (along, across) = face.corner_axes();
+                        let corners = [
+                            corner_light(world, front, neg(along), neg(across)),
+                            corner_light(world, front, along, neg(across)),
+                            corner_light(world, front, along, across),
+                            corner_light(world, front, neg(along), across),
+                        ];
+                        push_face(&mut mesh, (x, y, z), face, block, corners);
                     }
                 }
             }
@@ -133,7 +193,17 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
 }
 
 /// Add one quad, as two triangles.
-fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16, light: f32) {
+const fn neg((x, y, z): (i32, i32, i32)) -> (i32, i32, i32) {
+    (-x, -y, -z)
+}
+
+fn push_face(
+    mesh: &mut Mesh,
+    at: (i32, i32, i32),
+    face: Face,
+    block: u16,
+    corners_light: [f32; 4],
+) {
     let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
     // Corners, wound anticlockwise seen from outside, so back-face culling keeps the right ones.
     let corners: [[f32; 3]; 4] = match face {
@@ -176,7 +246,7 @@ fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16, light
     };
     let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
-    for (corner, uv) in corners.iter().zip(uvs) {
+    for ((corner, uv), light) in corners.iter().zip(uvs).zip(corners_light) {
         mesh.vertices.push(Vertex {
             position: *corner,
             normal: face.normal(),

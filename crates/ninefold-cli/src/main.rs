@@ -120,7 +120,8 @@ fn join(target: &str, name: &str) -> ExitCode {
     // The column under our feet, as decoded. On a flat world this is known ground truth.
     let (bx, bz) = (start.x.floor() as i32, start.z.floor() as i32);
     println!("the column at x={bx} z={bz}:");
-    for y in (0..6).rev() {
+    let base = start.y.floor() as i32;
+    for y in ((base - 3)..(base + 2)).rev() {
         match session.block_at(bx, y, bz) {
             Some(block) => println!(
                 "  y={y}  id {:<3} meta {}  {}",

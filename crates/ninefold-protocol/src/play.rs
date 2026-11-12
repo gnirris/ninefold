@@ -21,6 +21,8 @@ const MULTI_BLOCK_CHANGE: i32 = 0x22;
 const CHUNK_DATA: i32 = 0x21;
 const MAP_CHUNK_BULK: i32 = 0x26;
 const CHAT: i32 = 0x02;
+const UPDATE_HEALTH: i32 = 0x06;
+const HELD_SLOT: i32 = 0x09;
 const DISCONNECT: i32 = 0x40;
 const SPAWN_PLAYER: i32 = 0x0C;
 const SPAWN_MOB: i32 = 0x0F;
@@ -121,6 +123,12 @@ pub struct Session {
     pub entities: HashMap<i32, Entity>,
     /// What has been said, newest last.
     pub chat: Vec<String>,
+    /// Hearts, out of twenty.
+    pub health: f32,
+    /// Drumsticks, out of twenty.
+    pub food: u8,
+    /// Which hotbar slot is in hand, 0..8.
+    pub held: u8,
 }
 
 impl Session {
@@ -136,6 +144,9 @@ impl Session {
             dirty: std::collections::HashSet::new(),
             entities: HashMap::new(),
             chat: Vec::new(),
+            health: 20.0,
+            food: 20,
+            held: 0,
         }
     }
 
@@ -212,6 +223,15 @@ impl Session {
                         self.chat.drain(..self.chat.len() - 64);
                     }
                 }
+            }
+            UPDATE_HEALTH => {
+                let mut r = Reader::new(&payload);
+                self.health = r.f32().map_err(bad)?;
+                self.food = u8::try_from(r.var_int().map_err(bad)?.clamp(0, 20)).unwrap_or(20);
+            }
+            HELD_SLOT => {
+                let slot = Reader::new(&payload).u8().map_err(bad)?;
+                self.held = slot.min(8);
             }
             SPAWN_PLAYER => {
                 let mut r = Reader::new(&payload);

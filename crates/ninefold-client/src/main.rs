@@ -7,6 +7,7 @@
 //!   ninefold-client <host[:port]> [name]
 
 mod atlas;
+mod gui;
 mod world;
 
 use std::time::{Duration, Instant};
@@ -64,7 +65,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if font.is_none() {
         println!("no font/ascii in the assets: the readout will be invisible");
     }
-    let mut app = App::new(session, atlas, font);
+    let sheets = gui::sheets(assets.as_ref());
+    let mut app = App::new(session, atlas, font, sheets);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -96,6 +98,14 @@ struct App {
     fps: f64,
     /// The font sheet, kept until the renderer exists to take it.
     font: Option<ninefold_assets::Texture>,
+    /// The interface sheets, likewise.
+    sheets: gui::Sheets,
+    /// Window size, for laying the interface out.
+    screen: (u32, u32),
+    /// The readout, as F3 does in the real game.
+    debug: bool,
+    /// Hitboxes, as F3+B does.
+    hitboxes: bool,
 }
 
 #[derive(Default)]
@@ -110,7 +120,12 @@ struct Held {
 }
 
 impl App {
-    fn new(session: Session, atlas: atlas::Atlas, font: Option<ninefold_assets::Texture>) -> Self {
+    fn new(
+        session: Session,
+        atlas: atlas::Atlas,
+        font: Option<ninefold_assets::Texture>,
+        sheets: gui::Sheets,
+    ) -> Self {
         let p = session.position;
         Self {
             window: None,
@@ -137,6 +152,10 @@ impl App {
             counted_from: Instant::now(),
             fps: 0.0,
             font,
+            sheets,
+            screen: (1280, 720),
+            debug: false,
+            hitboxes: false,
         }
     }
 
@@ -224,6 +243,7 @@ impl ApplicationHandler for App {
         };
         let window = std::sync::Arc::new(window);
         let size = window.inner_size();
+        self.screen = (size.width, size.height);
         match ninefold_render::Renderer::new(window.clone(), size.width, size.height) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(e) => {
@@ -237,6 +257,7 @@ impl ApplicationHandler for App {
             if let Some(font) = &self.font {
                 renderer.set_font(font.width, font.height, &font.rgba);
             }
+            renderer.set_gui_sheets(self.sheets.width, self.sheets.height, &self.sheets.rgba);
         }
         self.window = Some(window);
         self.mesh_some();
@@ -246,6 +267,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                self.screen = (size.width, size.height);
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
@@ -292,6 +314,8 @@ impl ApplicationHandler for App {
                         KeyCode::Space => self.held.jump = down,
                         KeyCode::ShiftLeft => self.held.sneak = down,
                         KeyCode::ControlLeft => self.held.sprint = down,
+                        KeyCode::F3 if down => self.debug = !self.debug,
+                        KeyCode::KeyB if down && self.debug => self.hitboxes = !self.hitboxes,
                         KeyCode::Escape if down => {
                             if let Some(window) = &self.window {
                                 let _ = window.set_cursor_grab(CursorGrabMode::None);
@@ -341,6 +365,16 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // The game's own HUD, laid out in interface units and drawn from its own art.
+                {
+                    let mut hud = gui::Hud::new(self.screen.0, self.screen.1);
+                    hud.lay_out(self.session.held, self.session.health, self.session.food);
+                    let quads = hud.finish();
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_sprites(&quads);
+                    }
+                }
+
                 // The readout, and whatever has been said.
                 {
                     self.frames += 1;
@@ -352,47 +386,51 @@ impl ApplicationHandler for App {
                     }
                     let white = [1.0, 1.0, 1.0, 0.95];
                     let dim = [0.75, 0.78, 0.85, 0.9];
-                    let mut lines = vec![
-                        (format!("ninefold {}", env!("CARGO_PKG_VERSION")), white),
-                        (
-                            format!(
-                                "xyz {:.1} {:.1} {:.1}   chunk {} {}",
-                                self.body.x,
-                                self.body.y,
-                                self.body.z,
-                                (self.body.x / 16.0).floor() as i32,
-                                (self.body.z / 16.0).floor() as i32
+                    let mut lines = if !self.debug {
+                        Vec::new()
+                    } else {
+                        vec![
+                            (format!("ninefold {}", env!("CARGO_PKG_VERSION")), white),
+                            (
+                                format!(
+                                    "xyz {:.1} {:.1} {:.1}   chunk {} {}",
+                                    self.body.x,
+                                    self.body.y,
+                                    self.body.z,
+                                    (self.body.x / 16.0).floor() as i32,
+                                    (self.body.z / 16.0).floor() as i32
+                                ),
+                                dim,
                             ),
-                            dim,
-                        ),
-                        (
-                            format!(
-                                "{:.0} fps   {} chunks   {} entities",
-                                self.fps,
-                                self.meshed.len(),
-                                self.session.entities.len()
+                            (
+                                format!(
+                                    "{:.0} fps   {} chunks   {} entities",
+                                    self.fps,
+                                    self.meshed.len(),
+                                    self.session.entities.len()
+                                ),
+                                dim,
                             ),
-                            dim,
-                        ),
-                        (
-                            match self.aimed {
-                                Some(hit) => {
-                                    let block =
-                                        self.session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
-                                    format!(
-                                        "looking at {} {} {}  id {} meta {}",
-                                        hit.x,
-                                        hit.y,
-                                        hit.z,
-                                        block >> 4,
-                                        block & 0xF
-                                    )
-                                }
-                                None => "looking at nothing".to_owned(),
-                            },
-                            dim,
-                        ),
-                    ];
+                            (
+                                match self.aimed {
+                                    Some(hit) => {
+                                        let block =
+                                            self.session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
+                                        format!(
+                                            "looking at {} {} {}  id {} meta {}",
+                                            hit.x,
+                                            hit.y,
+                                            hit.z,
+                                            block >> 4,
+                                            block & 0xF
+                                        )
+                                    }
+                                    None => "looking at nothing".to_owned(),
+                                },
+                                dim,
+                            ),
+                        ]
+                    };
                     // The last few things said, oldest first, under the readout.
                     let said = self.session.chat.len().saturating_sub(5);
                     for line in &self.session.chat[said..] {
@@ -405,20 +443,23 @@ impl ApplicationHandler for App {
 
                 // Boxes round everything else in the world.
                 {
-                    let boxes: Vec<_> = self
-                        .session
-                        .entities
-                        .values()
-                        .map(|e| {
-                            let (w, h) = e.kind.size();
-                            let colour = match e.kind {
-                                play::Kind::Player => [1.0, 1.0, 1.0, 0.9],
-                                play::Kind::Mob(_) => [1.0, 0.4, 0.3, 0.85],
-                                play::Kind::Object(_) => [0.5, 0.8, 1.0, 0.8],
-                            };
-                            ([e.x as f32, e.y as f32, e.z as f32], [w, h, w], colour)
-                        })
-                        .collect();
+                    let boxes: Vec<_> = if !self.hitboxes {
+                        Vec::new()
+                    } else {
+                        self.session
+                            .entities
+                            .values()
+                            .map(|e| {
+                                let (w, h) = e.kind.size();
+                                let colour = match e.kind {
+                                    play::Kind::Player => [1.0, 1.0, 1.0, 0.9],
+                                    play::Kind::Mob(_) => [1.0, 0.4, 0.3, 0.85],
+                                    play::Kind::Object(_) => [0.5, 0.8, 1.0, 0.8],
+                                };
+                                ([e.x as f32, e.y as f32, e.z as f32], [w, h, w], colour)
+                            })
+                            .collect()
+                    };
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_entities(&boxes);
                     }

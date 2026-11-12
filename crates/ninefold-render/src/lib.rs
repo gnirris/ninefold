@@ -28,12 +28,18 @@ struct Uniforms {
     view_projection: Mat4,
     /// Where the sun is, for the flat shading.
     sun: [f32; 4],
+    /// Where the camera is, and how far it can see, for the fog.
+    eye: [f32; 4],
+    /// The colour distance fades into — the same as the sky, or the join shows.
+    sky: [f32; 4],
 }
 
 const SHADER: &str = r"
 struct Uniforms {
     view_projection: mat4x4<f32>,
     sun: vec4<f32>,
+    eye: vec4<f32>,
+    sky: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
@@ -43,6 +49,7 @@ struct Out {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) shade: f32,
+    @location(2) distance: f32,
 };
 
 @vertex
@@ -62,6 +69,9 @@ fn vs(
     // Never fully black: caves should be gloomy, not invisible.
     let reached = 0.12 + 0.88 * light;
     out.shade = shape * reached;
+    // The w of a perspective-projected point is its distance along the view axis, so this needs
+    // no camera position and cannot be wrong about where the eye is.
+    out.distance = out.clip.w;
     return out;
 }
 
@@ -73,7 +83,12 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     if texel.a < 0.5 {
         discard;
     }
-    return vec4<f32>(texel.rgb * in.shade, 1.0);
+    // Fade into the sky over the last quarter of the view, so chunks arriving at the edge of
+    // the world appear out of haze instead of popping into existence.
+    let far = 320.0;
+    let fog = clamp((in.distance - far * 0.72) / (far * 0.28), 0.0, 1.0);
+    let lit = texel.rgb * in.shade;
+    return vec4<f32>(mix(lit, u.sky.rgb, fog), 1.0);
 }
 ";
 
@@ -90,6 +105,8 @@ const OVERLAY_SHADER: &str = r"
 struct Uniforms {
     view_projection: mat4x4<f32>,
     sun: vec4<f32>,
+    eye: vec4<f32>,
+    sky: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
@@ -165,9 +182,18 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     if texel.a < 0.5 {
         discard;
     }
-    return vec4<f32>(in.colour.rgb, in.colour.a);
+    // Keep the texture's colour: the font is white so this tints glyphs as before, while the
+    // interface art — hotbar, hearts — keeps the colours it was drawn with.
+    return vec4<f32>(texel.rgb * in.colour.rgb, texel.a * in.colour.a);
 }
 ";
+
+/// How far the world is drawn. The fog has to end before this, or chunks pop in at full
+/// brightness right on the edge.
+const FAR: f32 = 320.0;
+
+/// 1.8's daytime sky, and so the colour the fog fades into.
+const SKY: [f32; 4] = [0.47, 0.65, 1.0, 1.0];
 
 /// Everything needed to draw, tied to one window.
 pub struct Renderer {
@@ -193,6 +219,8 @@ pub struct Renderer {
     text: wgpu::RenderPipeline,
     font: Option<wgpu::BindGroup>,
     text_mesh: Option<(wgpu::Buffer, u32)>,
+    gui: Option<wgpu::BindGroup>,
+    gui_mesh: Option<(wgpu::Buffer, u32)>,
 }
 
 impl Renderer {
@@ -253,7 +281,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -446,6 +474,8 @@ impl Renderer {
             text,
             font: None,
             text_mesh: None,
+            gui: None,
+            gui_mesh: None,
         };
         renderer.build_crosshair();
         Ok(renderer)
@@ -619,6 +649,46 @@ impl Renderer {
         }));
     }
 
+    /// Hand over the interface sheets — the hotbar, crosshair, hearts and so on.
+    pub fn set_gui_sheets(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("gui", width, height, rgba);
+        self.gui = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gui"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        }));
+    }
+
+    /// The interface quads for this frame, already in clip space.
+    pub fn set_sprites(&mut self, quads: &[Glyph]) {
+        use wgpu::util::DeviceExt;
+        if quads.is_empty() {
+            self.gui_mesh = None;
+            return;
+        }
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gui"),
+                contents: bytemuck::cast_slice(quads),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.gui_mesh = Some((buffer, u32::try_from(quads.len()).unwrap_or(0)));
+    }
+
     /// Lay out lines of text from the top left, in pixels, and keep them for drawing.
     pub fn set_text(&mut self, lines: &[(String, [f32; 4])]) {
         use wgpu::util::DeviceExt;
@@ -762,7 +832,7 @@ impl Renderer {
     /// Draw one frame from the given eye.
     pub fn draw(&mut self, eye: [f32; 3], direction: [f32; 3]) {
         let view = camera::look_to(eye, direction, [0.0, 1.0, 0.0]);
-        let projection = camera::perspective(70.0, self.aspect(), 0.05, 512.0);
+        let projection = camera::perspective(70.0, self.aspect(), 0.05, FAR);
         self.queue.write_buffer(
             &self.uniforms,
             0,
@@ -770,6 +840,8 @@ impl Renderer {
                 view_projection: camera::multiply(view, projection),
                 // Afternoon sun, slightly off to one side so the faces of a cube differ.
                 sun: [0.4, 0.9, 0.25, 0.0],
+                eye: [eye[0], eye[1], eye[2], FAR],
+                sky: SKY,
             }),
         );
 
@@ -801,9 +873,9 @@ impl Renderer {
                     ops: wgpu::Operations {
                         // 1.8's sky blue.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.47,
-                            g: 0.65,
-                            b: 1.0,
+                            r: f64::from(SKY[0]),
+                            g: f64::from(SKY[1]),
+                            b: f64::from(SKY[2]),
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -842,11 +914,13 @@ impl Renderer {
                     pass.set_vertex_buffer(0, lines.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
-                if let Some((shape, count)) = &self.crosshair_mesh {
-                    pass.set_pipeline(&self.crosshair);
-                    pass.set_vertex_buffer(0, shape.slice(..));
-                    pass.draw(0..*count, 0..1);
-                }
+            }
+            // The interface, then the text, both over the world.
+            if let (Some((quads, count)), Some(gui)) = (&self.gui_mesh, &self.gui) {
+                pass.set_pipeline(&self.text);
+                pass.set_bind_group(0, Some(gui), &[]);
+                pass.set_vertex_buffer(0, quads.slice(..));
+                pass.draw(0..*count, 0..1);
             }
             // Text last, over everything, with the font bound in place of the block atlas.
             if let (Some((glyphs, count)), Some(font)) = (&self.text_mesh, &self.font) {

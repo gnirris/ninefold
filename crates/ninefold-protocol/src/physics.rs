@@ -155,6 +155,13 @@ impl Body {
             }
         }
 
+        // Sneaking at an edge: 1.8 will not let you walk off the block you are standing on.
+        // It shaves the step down until there is still ground under you, rather than stopping
+        // you dead, which is why you can still shuffle along the very lip of a drop.
+        if input.sneak && self.on_ground {
+            self.creep(world);
+        }
+
         self.move_by(world);
 
         // Gravity is applied after the move, which is what puts the jump apex at 1.2522.
@@ -164,6 +171,47 @@ impl Body {
             if motion.abs() < STOPPED {
                 *motion = 0.0;
             }
+        }
+    }
+
+    /// Trim this tick's movement so a sneaking player keeps ground beneath them.
+    fn creep(&mut self, world: &impl World) {
+        /// What vanilla shaves off at a time.
+        const BITE: f64 = 0.05;
+
+        let grounded = |x: f64, z: f64, body: &Body| {
+            let probe = Body { x, z, ..*body };
+            probe.standing_on(world, body.y)
+        };
+        while self.motion_x != 0.0 && !grounded(self.x + self.motion_x, self.z, self) {
+            self.motion_x = if self.motion_x.abs() < BITE {
+                0.0
+            } else {
+                self.motion_x - BITE.copysign(self.motion_x)
+            };
+        }
+        while self.motion_z != 0.0 && !grounded(self.x, self.z + self.motion_z, self) {
+            self.motion_z = if self.motion_z.abs() < BITE {
+                0.0
+            } else {
+                self.motion_z - BITE.copysign(self.motion_z)
+            };
+        }
+        // Both together can still leave the corner hanging, so check the pair as well.
+        while self.motion_x != 0.0
+            && self.motion_z != 0.0
+            && !grounded(self.x + self.motion_x, self.z + self.motion_z, self)
+        {
+            self.motion_x = if self.motion_x.abs() < BITE {
+                0.0
+            } else {
+                self.motion_x - BITE.copysign(self.motion_x)
+            };
+            self.motion_z = if self.motion_z.abs() < BITE {
+                0.0
+            } else {
+                self.motion_z - BITE.copysign(self.motion_z)
+            };
         }
     }
 
@@ -442,6 +490,93 @@ mod tests {
         assert!(
             speed > 1.2 && speed < 1.4,
             "sneaking is ~1.3 b/s, got {speed}"
+        );
+    }
+
+    /// One block to stand on, nothing around it.
+    struct Pillar;
+    impl World for Pillar {
+        fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+            (x, y, z) == (0, 3, 0)
+        }
+    }
+
+    #[test]
+    fn walking_off_a_ledge_falls() {
+        let mut body = Body {
+            x: 0.5,
+            y: 4.0,
+            z: 0.5,
+            on_ground: true,
+            ..Body::default()
+        };
+        let east = Input {
+            forward: 1.0,
+            yaw: -90.0,
+            ..Input::default()
+        };
+        for _ in 0..40 {
+            body.tick(east, &Pillar);
+        }
+        assert!(
+            body.y < 3.0,
+            "should have walked off and fallen, y={}",
+            body.y
+        );
+    }
+
+    #[test]
+    fn sneaking_at_a_ledge_keeps_you_on_it() {
+        let mut body = Body {
+            x: 0.5,
+            y: 4.0,
+            z: 0.5,
+            on_ground: true,
+            ..Body::default()
+        };
+        let east_sneaking = Input {
+            forward: 1.0,
+            sneak: true,
+            yaw: -90.0,
+            ..Input::default()
+        };
+        for _ in 0..80 {
+            body.tick(east_sneaking, &Pillar);
+        }
+        assert!(body.on_ground, "should still be standing");
+        assert!(
+            (body.y - 4.0).abs() < 1e-9,
+            "should not have fallen, y={}",
+            body.y
+        );
+        // Shuffled out to the lip and stopped. The box is 0.6 wide and only has to overlap the
+        // block, so leaning half a body over the edge is right — it is what vanilla does.
+        assert!(
+            body.x > 0.5 && body.x <= 1.0 + WIDTH / 2.0,
+            "x={} should still be over the block",
+            body.x
+        );
+    }
+
+    #[test]
+    fn sneaking_in_the_open_still_moves_normally() {
+        let world = Floor { ground: 4 };
+        let mut body = standing();
+        for _ in 0..40 {
+            body.tick(
+                Input {
+                    forward: 1.0,
+                    sneak: true,
+                    yaw: -90.0,
+                    ..Input::default()
+                },
+                &world,
+            );
+        }
+        assert!(
+            body.x > 2.0,
+            "sneaking over solid ground still moves: x={}",
+            body.x
         );
     }
 
