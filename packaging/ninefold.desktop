@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=ninefold
+GenericName=Minecraft 1.8.9 client
+Comment=Minecraft Java Edition 1.8.9, rewritten in Rust
+Exec=@BINARY@
+Icon=ninefold
+Terminal=false
+Categories=Game;ActionGame;
+Keywords=minecraft;1.8.9;voxel;rust;pvp;
+StartupNotify=true
+StartupWMClass=ninefold
+Actions=Local;
+
+[Desktop Action Local]
+Name=Join the usual server
+Exec=@BINARY@ @SERVER@ --join

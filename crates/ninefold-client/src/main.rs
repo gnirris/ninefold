@@ -41,6 +41,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 const EYE_HEIGHT: f64 = 1.62;
 /// Degrees of turn per pixel of mouse movement.
 const SENSITIVITY: f64 = 0.15;
+/// What the desktop knows this window as, matching `ninefold.desktop`.
+const APP_ID: &str = "ninefold";
 /// How much of the way an entity is moved towards where the server says it is, per frame.
 ///
 /// The server sends an entity's position twenty times a second at best, and often less; drawing
@@ -1054,6 +1056,18 @@ impl ApplicationHandler for App {
         let attributes = Window::default_attributes()
             .with_title("ninefold")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        // The desktop matches a window to its launcher entry by this name, not by the title, so
+        // without it the taskbar shows a blank icon and the entry's own icon is never used.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attributes = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            use winit::platform::x11::WindowAttributesExtX11;
+            WindowAttributesExtX11::with_name(
+                WindowAttributesExtWayland::with_name(attributes, APP_ID, APP_ID),
+                APP_ID,
+                APP_ID,
+            )
+        };
         let Ok(window) = event_loop.create_window(attributes) else {
             eprintln!("could not open a window");
             event_loop.exit();

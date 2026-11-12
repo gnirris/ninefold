@@ -140,6 +140,16 @@ throws away a "finished" that arrives too early. In creative it is one hit, as i
 The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
 so movement is identical at 30 frames a second or 300.
 
+To put it in the application menu, pointing at the binary in this checkout:
+
+```sh
+packaging/install.sh                      # title screen only
+packaging/install.sh 127.0.0.1:25599 me   # and a "join the usual server" entry under it
+```
+
+The entry and the icon go under `~/.local/share`, so nothing a package manager owns is touched.
+A rebuild needs nothing; moving the checkout means running it again.
+
 ## The block table
 
 Around 130 entries covering what an overworld is actually made of, keyed by id and optionally by

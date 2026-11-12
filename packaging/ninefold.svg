@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <title>ninefold</title>
+  <!-- A voxel seen from the corner, the way a block is drawn in an inventory slot. Drawn here
+       rather than taken from anyone's texture pack: ninefold ships no game artwork. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2535"/>
+      <stop offset="1" stop-color="#0d1118"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="48" fill="url(#sky)"/>
+
+  <!-- Top: grass, lit. -->
+  <path d="M128 40 216 84 128 128 40 84 Z" fill="#7cb342"/>
+  <path d="M128 40 216 84 128 128 Z" fill="#8bc34a"/>
+
+  <!-- Left side: dirt in shadow, with the grass fringe over it. -->
+  <path d="M40 84 128 128 128 216 40 172 Z" fill="#6d4c33"/>
+  <path d="M40 84 128 128 128 146 40 102 Z" fill="#5d8a32"/>
+
+  <!-- Right side: dirt, catching more light. -->
+  <path d="M128 128 216 84 216 172 128 216 Z" fill="#8a6244"/>
+  <path d="M128 128 216 84 216 102 128 146 Z" fill="#6ea33b"/>
+
+  <!-- Three pixels of texture, so it reads as voxel rather than as a plain solid. -->
+  <g opacity="0.22" fill="#000">
+    <path d="M62 112 84 123 84 141 62 130 Z"/>
+    <path d="M106 156 128 167 128 185 106 174 Z"/>
+    <path d="M150 145 172 134 172 152 150 163 Z"/>
+  </g>
+  <g opacity="0.16" fill="#fff">
+    <path d="M106 62 128 73 106 84 84 73 Z"/>
+    <path d="M150 84 172 95 150 106 128 95 Z"/>
+  </g>
+</svg>
