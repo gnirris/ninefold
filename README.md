@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain; entities and HUD next |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain, entity boxes, crosshair, block outline and breaking |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -118,7 +118,8 @@ cargo run --release -p ninefold-client -- 127.0.0.1:25599 name        # with a w
 ```
 
 In the window: WASD to move, space to jump, left control to sprint, left shift to sneak, click to
-take the mouse for looking, escape to give it back.
+take the mouse for looking, escape to give it back. Once the mouse is taken, left click breaks
+the block under the crosshair.
 
 The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
 so movement is identical at 30 frames a second or 300.

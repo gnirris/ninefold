@@ -70,6 +70,51 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// A line or a flat shape drawn over the world.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Overlay {
+    pub position: [f32; 3],
+    pub colour: [f32; 4],
+}
+
+/// The crosshair and the outline round the block you are looking at.
+const OVERLAY_SHADER: &str = r"
+struct Uniforms {
+    view_projection: mat4x4<f32>,
+    sun: vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) colour: vec4<f32>,
+};
+
+// In the world: the outline round a block.
+@vertex
+fn vs_world(@location(0) position: vec3<f32>, @location(1) colour: vec4<f32>) -> Out {
+    var out: Out;
+    out.clip = u.view_projection * vec4<f32>(position, 1.0);
+    out.colour = colour;
+    return out;
+}
+
+// On the glass: the crosshair, already in clip space.
+@vertex
+fn vs_screen(@location(0) position: vec3<f32>, @location(1) colour: vec4<f32>) -> Out {
+    var out: Out;
+    out.clip = vec4<f32>(position, 1.0);
+    out.colour = colour;
+    return out;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    return in.colour;
+}
+";
+
 /// Everything needed to draw, tied to one window.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -83,7 +128,14 @@ pub struct Renderer {
     /// Built once an atlas has been handed over; nothing can be drawn before that.
     bind_group: Option<wgpu::BindGroup>,
     depth: wgpu::TextureView,
-    geometry: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// One set of buffers per chunk column, so a column that changes costs only itself.
+    /// Rebuilding the lot for one new chunk is what made this stutter.
+    columns: std::collections::HashMap<(i32, i32), (wgpu::Buffer, wgpu::Buffer, u32)>,
+    outline: wgpu::RenderPipeline,
+    crosshair: wgpu::RenderPipeline,
+    highlight: Option<(wgpu::Buffer, u32)>,
+    entities: Option<(wgpu::Buffer, u32)>,
+    crosshair_mesh: Option<(wgpu::Buffer, u32)>,
 }
 
 impl Renderer {
@@ -219,9 +271,65 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        // Two more pipelines sharing one shader: lines in the world, and flat shapes on the
+        // glass. Both reuse the same bind group; the overlay shader simply ignores the atlas.
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+        });
+        let overlay_buffers = [Some(wgpu::VertexBufferLayout {
+            array_stride: size_of::<Overlay>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+        })];
+        let mut overlay_pipeline = |entry: &str, topology, depth: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("overlay"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &overlay_shader,
+                    entry_point: Some(entry),
+                    buffers: &overlay_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &overlay_shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    // The outline sits exactly on the block's surface, so it has to pass where
+                    // the depths are equal or it z-fights with the face it outlines.
+                    depth_compare: Some(if depth {
+                        wgpu::CompareFunction::LessEqual
+                    } else {
+                        wgpu::CompareFunction::Always
+                    }),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let outline = overlay_pipeline("vs_world", wgpu::PrimitiveTopology::LineList, true);
+        let crosshair = overlay_pipeline("vs_screen", wgpu::PrimitiveTopology::TriangleList, false);
+
         let depth = depth_view(&device, &config);
 
-        Ok(Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -232,8 +340,15 @@ impl Renderer {
             sampler,
             bind_group: None,
             depth,
-            geometry: None,
-        })
+            columns: std::collections::HashMap::new(),
+            outline,
+            crosshair,
+            highlight: None,
+            entities: None,
+            crosshair_mesh: None,
+        };
+        renderer.build_crosshair();
+        Ok(renderer)
     }
 
     /// Hand over the texture atlas. Everything drawn afterwards samples from it.
@@ -292,6 +407,7 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
         self.depth = depth_view(&self.device, &self.config);
+        self.build_crosshair();
     }
 
     #[must_use]
@@ -299,32 +415,151 @@ impl Renderer {
         self.config.width as f32 / self.config.height.max(1) as f32
     }
 
-    /// Hand the world over. Called again whenever the chunks change.
-    pub fn set_geometry(&mut self, vertices: &[Vertex], indices: &[u32]) {
+    /// Give one column its geometry, replacing whatever it had.
+    pub fn set_column(&mut self, at: (i32, i32), vertices: &[Vertex], indices: &[u32]) {
         use wgpu::util::DeviceExt;
         if indices.is_empty() {
-            self.geometry = None;
+            self.columns.remove(&at);
             return;
         }
         let vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("vertices"),
+                label: Some("column vertices"),
                 contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
         let index_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("indices"),
+                label: Some("column indices"),
                 contents: bytemuck::cast_slice(indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-        self.geometry = Some((
-            vertex_buffer,
-            index_buffer,
-            u32::try_from(indices.len()).unwrap_or(u32::MAX),
-        ));
+        self.columns.insert(
+            at,
+            (
+                vertex_buffer,
+                index_buffer,
+                u32::try_from(indices.len()).unwrap_or(u32::MAX),
+            ),
+        );
+    }
+
+    /// Outline the block being looked at, or nothing.
+    pub fn set_highlight(&mut self, block: Option<(i32, i32, i32)>) {
+        use wgpu::util::DeviceExt;
+        let Some((x, y, z)) = block else {
+            self.highlight = None;
+            return;
+        };
+        // A hair outside the block, so the lines are not buried in its own faces.
+        const OUT: f32 = 0.002;
+        let (lo, hi) = (-OUT, 1.0 + OUT);
+        let corner = |cx: f32, cy: f32, cz: f32| Overlay {
+            position: [x as f32 + cx, y as f32 + cy, z as f32 + cz],
+            colour: [0.0, 0.0, 0.0, 0.65],
+        };
+        let mut lines = Vec::with_capacity(24);
+        // Four uprights, and the squares top and bottom.
+        for (ax, az) in [(lo, lo), (hi, lo), (hi, hi), (lo, hi)] {
+            lines.push(corner(ax, lo, az));
+            lines.push(corner(ax, hi, az));
+        }
+        for level in [lo, hi] {
+            let square = [(lo, lo), (hi, lo), (hi, hi), (lo, hi)];
+            for i in 0..4 {
+                let (ax, az) = square[i];
+                let (bx, bz) = square[(i + 1) % 4];
+                lines.push(corner(ax, level, az));
+                lines.push(corner(bx, level, bz));
+            }
+        }
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("highlight"),
+                contents: bytemuck::cast_slice(&lines),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.highlight = Some((buffer, u32::try_from(lines.len()).unwrap_or(0)));
+    }
+
+    /// Draw a box round each thing in the world. Crude, but it is the difference between a
+    /// world with other players in it and an empty one; proper models come later.
+    pub fn set_entities(&mut self, boxes: &[([f32; 3], [f32; 3], [f32; 4])]) {
+        use wgpu::util::DeviceExt;
+        if boxes.is_empty() {
+            self.entities = None;
+            return;
+        }
+        let mut lines = Vec::with_capacity(boxes.len() * 24);
+        for (centre, size, colour) in boxes {
+            let (hw, h) = (size[0] / 2.0, size[1]);
+            let corner = |dx: f32, dy: f32, dz: f32| Overlay {
+                position: [centre[0] + dx, centre[1] + dy, centre[2] + dz],
+                colour: *colour,
+            };
+            let feet = [(-hw, -hw), (hw, -hw), (hw, hw), (-hw, hw)];
+            for (x, z) in feet {
+                lines.push(corner(x, 0.0, z));
+                lines.push(corner(x, h, z));
+            }
+            for level in [0.0, h] {
+                for i in 0..4 {
+                    let (ax, az) = feet[i];
+                    let (bx, bz) = feet[(i + 1) % 4];
+                    lines.push(corner(ax, level, az));
+                    lines.push(corner(bx, level, bz));
+                }
+            }
+        }
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("entities"),
+                contents: bytemuck::cast_slice(&lines),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.entities = Some((buffer, u32::try_from(lines.len()).unwrap_or(0)));
+    }
+
+    /// Rebuild the crosshair for the current window shape, so it stays square.
+    fn build_crosshair(&mut self) {
+        use wgpu::util::DeviceExt;
+        let aspect = self.aspect();
+        // Nine pixels long, one wide, in clip space.
+        let long = 9.0 / self.config.height as f32;
+        let thin = 1.0 / self.config.height as f32;
+        let colour = [1.0, 1.0, 1.0, 0.8];
+        let quad = |w: f32, h: f32| {
+            let corners = [[-w, -h], [w, -h], [w, h], [-w, -h], [w, h], [-w, h]];
+            corners.map(|[x, y]| Overlay {
+                position: [x, y, 0.0],
+                colour,
+            })
+        };
+        let mut shape = Vec::with_capacity(12);
+        shape.extend(quad(long / aspect, thin));
+        shape.extend(quad(thin / aspect, long));
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("crosshair"),
+                contents: bytemuck::cast_slice(&shape),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.crosshair_mesh = Some((buffer, u32::try_from(shape.len()).unwrap_or(0)));
+    }
+
+    /// Forget a column the server has unloaded.
+    pub fn remove_column(&mut self, at: (i32, i32)) {
+        self.columns.remove(&at);
+    }
+
+    #[must_use]
+    pub fn columns_drawn(&self) -> usize {
+        self.columns.len()
     }
 
     /// Draw one frame from the given eye.
@@ -389,14 +624,32 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let (Some((vertices, indices, count)), Some(bind_group)) =
-                (&self.geometry, &self.bind_group)
-            {
+            if let Some(bind_group) = &self.bind_group {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, Some(bind_group), &[]);
-                pass.set_vertex_buffer(0, vertices.slice(..));
-                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..*count, 0, 0..1);
+                // One draw per column. A couple of hundred draws costs far less than rebuilding
+                // every buffer because one chunk arrived.
+                for (vertices, indices, count) in self.columns.values() {
+                    pass.set_vertex_buffer(0, vertices.slice(..));
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+
+                if let Some((lines, count)) = &self.entities {
+                    pass.set_pipeline(&self.outline);
+                    pass.set_vertex_buffer(0, lines.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
+                if let Some((lines, count)) = &self.highlight {
+                    pass.set_pipeline(&self.outline);
+                    pass.set_vertex_buffer(0, lines.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
+                if let Some((shape, count)) = &self.crosshair_mesh {
+                    pass.set_pipeline(&self.crosshair);
+                    pass.set_vertex_buffer(0, shape.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         }
         self.queue.submit([encoder.finish()]);

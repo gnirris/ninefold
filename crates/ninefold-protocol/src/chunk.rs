@@ -62,6 +62,26 @@ impl Column {
         }
     }
 
+    /// Put a block into the column, growing an all-air section into existence if need be.
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: u16) {
+        if y >= SECTIONS * 16 {
+            return;
+        }
+        let section = &mut self.sections[y / 16];
+        if section.is_none() {
+            if block >> 4 == 0 {
+                // Air into air: nothing to store.
+                return;
+            }
+            *section = Some(Section {
+                blocks: vec![0; SECTION_BLOCKS],
+            });
+        }
+        if let Some(section) = section {
+            section.blocks[(y % 16) * 256 + z * 16 + x] = block;
+        }
+    }
+
     /// How many blocks in the column are not air. Cheap sanity check on a decode.
     #[must_use]
     pub fn solid_count(&self) -> usize {

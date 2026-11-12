@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use ninefold_protocol::physics::{Body, Input, TPS};
 use ninefold_protocol::play::{self, Session};
+use ninefold_protocol::raycast;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -72,11 +73,18 @@ struct App {
     held: Held,
     yaw: f64,
     pitch: f64,
+    /// Where the player was at the end of the previous tick. The camera is drawn somewhere
+    /// between this and where they are now, because 20 positions a second is visibly steppy
+    /// however fast the frames come.
+    previous: [f64; 3],
     /// Time owed to the physics clock, so it ticks at 20 Hz whatever the frame rate.
     owed: Duration,
     last_frame: Instant,
-    chunks_when_meshed: usize,
+    /// Columns already given to the renderer, so only new or changed ones are meshed.
+    meshed: std::collections::HashSet<(i32, i32)>,
     looking: bool,
+    /// The block under the crosshair, if any.
+    aimed: Option<raycast::Hit>,
 }
 
 #[derive(Default)]
@@ -103,6 +111,7 @@ impl App {
                 on_ground: true,
                 ..Body::default()
             },
+            previous: [p.x, p.y, p.z],
             yaw: f64::from(p.yaw),
             pitch: f64::from(p.pitch),
             session,
@@ -110,29 +119,60 @@ impl App {
             held: Held::default(),
             owed: Duration::ZERO,
             last_frame: Instant::now(),
-            chunks_when_meshed: usize::MAX,
+            meshed: std::collections::HashSet::new(),
             looking: false,
+            aimed: None,
         }
     }
 
-    /// Rebuild the geometry, but only when the world has actually changed.
-    fn remesh_if_needed(&mut self) {
-        if self.session.columns.len() == self.chunks_when_meshed {
-            return;
+    /// Mesh the columns that need it, a few at a time.
+    ///
+    /// Meshing a column takes a few milliseconds, so doing every new one in a single frame is a
+    /// visible freeze when a handful arrive at once. A budget per frame spreads it out: terrain
+    /// fills in over a few frames instead of the window locking up.
+    fn mesh_some(&mut self) {
+        const PER_FRAME: usize = 2;
+
+        // Columns the server has unloaded: drop their buffers.
+        let gone: Vec<_> = self
+            .meshed
+            .iter()
+            .copied()
+            .filter(|at| !self.session.columns.contains_key(at))
+            .collect();
+        for at in gone {
+            self.meshed.remove(&at);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.remove_column(at);
+            }
         }
-        self.chunks_when_meshed = self.session.columns.len();
-        let (vertices, indices) = world::geometry(&self.session, &self.atlas);
-        if let Some(renderer) = &mut self.renderer {
-            renderer.set_geometry(&vertices, &indices);
-        }
-        println!(
-            "meshed {} chunks: {} vertices",
-            self.chunks_when_meshed,
-            vertices.len()
+
+        // New or changed columns, nearest first so what you are looking at fills in soonest.
+        let here = (
+            (self.body.x / 16.0).floor() as i32,
+            (self.body.z / 16.0).floor() as i32,
         );
+        let mut todo: Vec<(i32, i32)> = self
+            .session
+            .columns
+            .keys()
+            .copied()
+            .filter(|at| !self.meshed.contains(at) || self.session.dirty.contains(at))
+            .collect();
+        todo.sort_by_key(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2));
+
+        for at in todo.into_iter().take(PER_FRAME) {
+            let (vertices, indices) = world::column(&self.session, &self.atlas, at);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_column(at, &vertices, &indices);
+            }
+            self.meshed.insert(at);
+            self.session.dirty.remove(&at);
+        }
     }
 
     fn tick_physics(&mut self) {
+        self.previous = [self.body.x, self.body.y, self.body.z];
         let input = Input {
             forward: f64::from(i8::from(self.held.forward) - i8::from(self.held.back)),
             strafe: f64::from(i8::from(self.held.left) - i8::from(self.held.right)),
@@ -181,7 +221,7 @@ impl ApplicationHandler for App {
             renderer.set_atlas(self.atlas.width, self.atlas.height, &self.atlas.rgba);
         }
         self.window = Some(window);
-        self.remesh_if_needed();
+        self.mesh_some();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -192,7 +232,23 @@ impl ApplicationHandler for App {
                     renderer.resize(size.width, size.height);
                 }
             }
-            WindowEvent::MouseInput { state, .. } => {
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed && self.looking {
+                    // Looking already: a click is a swing at whatever is under the crosshair.
+                    if button == winit::event::MouseButton::Left
+                        && let Some(hit) = self.aimed
+                    {
+                        if let Err(e) = self.session.dig(hit.x, hit.y, hit.z, hit.side as u8) {
+                            eprintln!("could not dig: {e}");
+                        } else {
+                            // Take it out locally too, rather than waiting for the server to
+                            // tell us what we already know.
+                            self.session.set_block(hit.x, hit.y, hit.z, 0);
+                        }
+                    } else if let Err(e) = self.session.swing() {
+                        eprintln!("could not swing: {e}");
+                    }
+                }
                 if state == ElementState::Pressed
                     && !self.looking
                     && let Some(window) = &self.window
@@ -236,7 +292,7 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                self.remesh_if_needed();
+                self.mesh_some();
 
                 // Physics on its own clock, so movement does not depend on frame rate.
                 let tick = Duration::from_secs_f64(1.0 / TPS);
@@ -249,11 +305,54 @@ impl ApplicationHandler for App {
                     self.tick_physics();
                 }
 
+                {
+                    let eye = [self.body.x, self.body.y + EYE_HEIGHT, self.body.z];
+                    let facing =
+                        ninefold_render::camera::facing(self.yaw as f32, self.pitch as f32);
+                    let direction = [
+                        f64::from(facing[0]),
+                        f64::from(facing[1]),
+                        f64::from(facing[2]),
+                    ];
+                    let aimed = raycast::cast(&self.session, eye, direction, raycast::REACH);
+                    if aimed != self.aimed {
+                        self.aimed = aimed;
+                        if let Some(renderer) = &mut self.renderer {
+                            renderer.set_highlight(aimed.map(|h| (h.x, h.y, h.z)));
+                        }
+                    }
+                }
+
+                // Boxes round everything else in the world.
+                {
+                    let boxes: Vec<_> = self
+                        .session
+                        .entities
+                        .values()
+                        .map(|e| {
+                            let (w, h) = e.kind.size();
+                            let colour = match e.kind {
+                                play::Kind::Player => [1.0, 1.0, 1.0, 0.9],
+                                play::Kind::Mob(_) => [1.0, 0.4, 0.3, 0.85],
+                                play::Kind::Object(_) => [0.5, 0.8, 1.0, 0.8],
+                            };
+                            ([e.x as f32, e.y as f32, e.z as f32], [w, h, w], colour)
+                        })
+                        .collect();
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_entities(&boxes);
+                    }
+                }
+
                 if let Some(renderer) = &mut self.renderer {
+                    // How far into the next tick we are, so the camera glides between the two
+                    // positions instead of stepping twenty times a second.
+                    let alpha = (self.owed.as_secs_f64() * TPS).clamp(0.0, 1.0);
+                    let between = |from: f64, to: f64| from + (to - from) * alpha;
                     let eye = [
-                        self.body.x as f32,
-                        (self.body.y + EYE_HEIGHT) as f32,
-                        self.body.z as f32,
+                        between(self.previous[0], self.body.x) as f32,
+                        (between(self.previous[1], self.body.y) + EYE_HEIGHT) as f32,
+                        between(self.previous[2], self.body.z) as f32,
                     ];
                     let direction =
                         ninefold_render::camera::facing(self.yaw as f32, self.pitch as f32);

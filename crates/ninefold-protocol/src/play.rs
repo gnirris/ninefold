@@ -16,13 +16,71 @@ use crate::{Reader, Writer};
 const KEEP_ALIVE: i32 = 0x00;
 const JOIN_GAME: i32 = 0x01;
 const POSITION_AND_LOOK: i32 = 0x08;
+const BLOCK_CHANGE: i32 = 0x23;
+const MULTI_BLOCK_CHANGE: i32 = 0x22;
 const CHUNK_DATA: i32 = 0x21;
 const MAP_CHUNK_BULK: i32 = 0x26;
 const DISCONNECT: i32 = 0x40;
+const SPAWN_PLAYER: i32 = 0x0C;
+const SPAWN_MOB: i32 = 0x0F;
+const SPAWN_OBJECT: i32 = 0x0E;
+const DESTROY_ENTITIES: i32 = 0x13;
+const ENTITY_MOVE: i32 = 0x15;
+const ENTITY_LOOK_MOVE: i32 = 0x17;
+const ENTITY_TELEPORT: i32 = 0x18;
 
 // Serverbound.
 const OUT_KEEP_ALIVE: i32 = 0x00;
+const OUT_DIG: i32 = 0x07;
+const OUT_SWING: i32 = 0x0A;
 const OUT_POSITION_AND_LOOK: i32 = 0x06;
+
+/// Something in the world that is not the player.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Entity {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub kind: Kind,
+}
+
+/// Enough to decide how big something is and what colour to draw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Player,
+    /// A living thing, by its 1.8 type number.
+    Mob(u8),
+    /// A dropped item, an arrow, a minecart and so on.
+    Object(u8),
+}
+
+impl Kind {
+    /// Width and height in blocks. Close enough to 1.8's hitboxes for the common ones.
+    #[must_use]
+    pub const fn size(self) -> (f32, f32) {
+        match self {
+            Kind::Player => (0.6, 1.8),
+            Kind::Mob(50 | 51) => (0.65, 1.8), // creeper, skeleton
+            Kind::Mob(54) => (0.6, 1.9),       // zombie
+            Kind::Mob(90) => (0.9, 0.9),       // pig
+            Kind::Mob(91 | 92) => (0.9, 1.3),  // sheep, cow
+            Kind::Mob(93) => (0.4, 0.7),       // chicken
+            Kind::Mob(_) => (0.8, 1.4),
+            Kind::Object(_) => (0.25, 0.25),
+        }
+    }
+}
+
+/// Positions arrive as fixed point: a block is 32.
+fn fixed(value: i32) -> f64 {
+    f64::from(value) / 32.0
+}
+
+/// And angles as a byte of a full turn.
+fn angle(value: u8) -> f32 {
+    f32::from(value) * 360.0 / 256.0
+}
 
 /// What the server says when you arrive.
 #[derive(Debug, Clone)]
@@ -56,6 +114,10 @@ pub struct Session {
     pub keep_alives: u32,
     /// Decoded columns, by chunk coordinate.
     pub columns: HashMap<(i32, i32), Column>,
+    /// Columns whose blocks have changed since they were last drawn.
+    pub dirty: std::collections::HashSet<(i32, i32)>,
+    /// Everything else in the world, by the server's entity id.
+    pub entities: HashMap<i32, Entity>,
 }
 
 impl Session {
@@ -68,6 +130,8 @@ impl Session {
             chunks_seen: 0,
             keep_alives: 0,
             columns: HashMap::new(),
+            dirty: std::collections::HashSet::new(),
+            entities: HashMap::new(),
         }
     }
 
@@ -110,6 +174,105 @@ impl Session {
                 self.placed = true;
                 // Answering this is what tells the server the teleport took.
                 self.send_position()?;
+            }
+            BLOCK_CHANGE => {
+                let mut r = Reader::new(&payload);
+                let (x, y, z) = decode_position(r.i64().map_err(bad)?);
+                let block = u16::try_from(r.var_int().map_err(bad)?).unwrap_or(0);
+                self.set_block(x, y, z, block);
+            }
+            MULTI_BLOCK_CHANGE => {
+                let mut r = Reader::new(&payload);
+                let (cx, cz) = (r.i32().map_err(bad)?, r.i32().map_err(bad)?);
+                let count = r.var_int().map_err(bad)?.max(0);
+                for _ in 0..count {
+                    // Packed into two bytes: x and z as nibbles, then y.
+                    let packed = r.u16().map_err(bad)?;
+                    let (x, z, y) = (
+                        i32::from(packed >> 12),
+                        i32::from((packed >> 8) & 0xF),
+                        i32::from(packed & 0xFF),
+                    );
+                    let block = u16::try_from(r.var_int().map_err(bad)?).unwrap_or(0);
+                    self.set_block(cx * 16 + x, y, cz * 16 + z, block);
+                }
+            }
+            SPAWN_PLAYER => {
+                let mut r = Reader::new(&payload);
+                let entity_id = r.var_int().map_err(bad)?;
+                // Sixteen bytes of UUID, which nothing here needs yet.
+                for _ in 0..16 {
+                    r.u8().map_err(bad)?;
+                }
+                let entity = Entity {
+                    x: fixed(r.i32().map_err(bad)?),
+                    y: fixed(r.i32().map_err(bad)?),
+                    z: fixed(r.i32().map_err(bad)?),
+                    yaw: angle(r.u8().map_err(bad)?),
+                    kind: Kind::Player,
+                };
+                self.entities.insert(entity_id, entity);
+            }
+            SPAWN_MOB | SPAWN_OBJECT => {
+                let packet = id;
+                let mut r = Reader::new(&payload);
+                let entity_id = r.var_int().map_err(bad)?;
+                let kind = r.u8().map_err(bad)?;
+                let entity = Entity {
+                    x: fixed(r.i32().map_err(bad)?),
+                    y: fixed(r.i32().map_err(bad)?),
+                    z: fixed(r.i32().map_err(bad)?),
+                    yaw: angle(r.u8().map_err(bad)?),
+                    kind: if packet == SPAWN_MOB {
+                        Kind::Mob(kind)
+                    } else {
+                        Kind::Object(kind)
+                    },
+                };
+                self.entities.insert(entity_id, entity);
+            }
+            DESTROY_ENTITIES => {
+                let mut r = Reader::new(&payload);
+                let count = r.var_int().map_err(bad)?.max(0);
+                for _ in 0..count {
+                    let gone = r.var_int().map_err(bad)?;
+                    self.entities.remove(&gone);
+                }
+            }
+            ENTITY_MOVE | ENTITY_LOOK_MOVE => {
+                let packet = id;
+                let mut r = Reader::new(&payload);
+                let entity_id = r.var_int().map_err(bad)?;
+                // Steps are eighths of a block... no: thirty-seconds, same as positions.
+                let (dx, dy, dz) = (
+                    r.i8().map_err(bad)?,
+                    r.i8().map_err(bad)?,
+                    r.i8().map_err(bad)?,
+                );
+                if let Some(entity) = self.entities.get_mut(&entity_id) {
+                    entity.x += f64::from(dx) / 32.0;
+                    entity.y += f64::from(dy) / 32.0;
+                    entity.z += f64::from(dz) / 32.0;
+                    if packet == ENTITY_LOOK_MOVE {
+                        entity.yaw = angle(r.u8().map_err(bad)?);
+                    }
+                }
+            }
+            ENTITY_TELEPORT => {
+                let mut r = Reader::new(&payload);
+                let entity_id = r.var_int().map_err(bad)?;
+                let (x, y, z) = (
+                    fixed(r.i32().map_err(bad)?),
+                    fixed(r.i32().map_err(bad)?),
+                    fixed(r.i32().map_err(bad)?),
+                );
+                let yaw = angle(r.u8().map_err(bad)?);
+                if let Some(entity) = self.entities.get_mut(&entity_id) {
+                    entity.x = x;
+                    entity.y = y;
+                    entity.z = z;
+                    entity.yaw = yaw;
+                }
             }
             CHUNK_DATA => {
                 self.chunks_seen += 1;
@@ -199,6 +362,58 @@ impl Session {
         ))
     }
 
+    /// Break the block being looked at.
+    ///
+    /// Two packets: started, then finished. A creative-mode server takes the block out at once;
+    /// in survival it times the dig and will ignore a finish that came too soon.
+    pub fn dig(&mut self, x: i32, y: i32, z: i32, side: u8) -> io::Result<()> {
+        let at = encode_position(x, y, z);
+        for status in [0u8, 2] {
+            self.connection.send(
+                OUT_DIG,
+                &body(|w: &mut Writer| {
+                    w.u8(status).i64(at).u8(side);
+                }),
+            )?;
+        }
+        self.swing()
+    }
+
+    /// Swing the arm, so other players see something happen.
+    pub fn swing(&mut self) -> io::Result<()> {
+        self.connection.send(OUT_SWING, &[])
+    }
+
+    /// Change one block, and note that its column needs drawing again.
+    pub fn set_block(&mut self, x: i32, y: i32, z: i32, block: u16) {
+        if !(0..256).contains(&y) {
+            return;
+        }
+        let at = (x.div_euclid(16), z.div_euclid(16));
+        if let Some(column) = self.columns.get_mut(&at) {
+            column.set_block(
+                x.rem_euclid(16) as usize,
+                y as usize,
+                z.rem_euclid(16) as usize,
+                block,
+            );
+            self.dirty.insert(at);
+            // A block on a chunk edge changes what its neighbour can see through.
+            if x.rem_euclid(16) == 0 {
+                self.dirty.insert((at.0 - 1, at.1));
+            }
+            if x.rem_euclid(16) == 15 {
+                self.dirty.insert((at.0 + 1, at.1));
+            }
+            if z.rem_euclid(16) == 0 {
+                self.dirty.insert((at.0, at.1 - 1));
+            }
+            if z.rem_euclid(16) == 15 {
+                self.dirty.insert((at.0, at.1 + 1));
+            }
+        }
+    }
+
     /// The block the player is standing on.
     #[must_use]
     pub fn block_below(&self) -> Option<u16> {
@@ -273,6 +488,53 @@ pub fn read_join(connection: &mut Connection) -> io::Result<Joined> {
     }
 }
 
+/// Pack a block position the way 1.8 wants it.
+#[must_use]
+pub fn encode_position(x: i32, y: i32, z: i32) -> i64 {
+    ((i64::from(x) & 0x3FF_FFFF) << 38)
+        | ((i64::from(y) & 0xFFF) << 26)
+        | (i64::from(z) & 0x3FF_FFFF)
+}
+
+/// 1.8 packs a block position into one long: 26 bits of x, 12 of y, 26 of z, all signed.
+fn decode_position(value: i64) -> (i32, i32, i32) {
+    let x = (value >> 38) as i32;
+    let y = ((value >> 26) & 0xFFF) as i32;
+    // Shifting left then arithmetic-right sign-extends the low 26 bits.
+    let z = ((value << 38) >> 38) as i32;
+    (x, y, z)
+}
+
 fn bad(e: crate::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_position;
+
+    #[test]
+    fn encoding_a_position_and_decoding_it_gives_the_same_block() {
+        for (x, y, z) in [(0, 0, 0), (1, 70, -3), (-30_000_000, 255, 30_000_000)] {
+            assert_eq!(
+                super::decode_position(super::encode_position(x, y, z)),
+                (x, y, z)
+            );
+        }
+    }
+
+    #[test]
+    fn a_packed_position_comes_back_out() {
+        // The encoding the server uses: x << 38 | (y & 0xFFF) << 26 | (z & 0x3FFFFFF).
+        for (x, y, z) in [
+            (0, 0, 0),
+            (1, 2, 3),
+            (-1, 255, -1),
+            (30_000_000, 64, -30_000_000),
+        ] {
+            let packed =
+                (i64::from(x) << 38) | ((i64::from(y) & 0xFFF) << 26) | (i64::from(z) & 0x3FF_FFFF);
+            assert_eq!(decode_position(packed), (x, y, z), "round trip {x},{y},{z}");
+        }
+    }
 }

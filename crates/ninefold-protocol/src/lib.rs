@@ -13,6 +13,7 @@ pub mod chunk;
 pub mod login;
 pub mod physics;
 pub mod play;
+pub mod raycast;
 pub mod status;
 pub mod wire;
 

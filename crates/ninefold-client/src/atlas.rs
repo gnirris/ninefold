@@ -536,6 +536,31 @@ fn blocks() -> Vec<Block> {
     ]
 }
 
+/// Blocks you can see through, so a face next to one is still worth drawing.
+///
+/// Culling against them is what turns a leaf canopy into a checkerboard: leaf textures are full
+/// of holes, so hiding the faces between two leaf blocks lets you see straight through the gaps
+/// into nothing.
+const SEE_THROUGH: [u16; 20] = [
+    0, 6, 8, 9, 18, 20, 26, 30, 31, 32, 37, 38, 39, 40, 65, 79, 101, 102, 106, 161,
+];
+
+/// Plants are crossed sprites in Minecraft, not cubes, and drawing them as cubes looks worse
+/// than leaving them out. They are skipped until the mesher can do cross-shaped blocks.
+const PLANTS: [u16; 12] = [6, 31, 32, 37, 38, 39, 40, 59, 104, 105, 141, 175];
+
+/// Does this block hide the face of whatever is next to it?
+#[must_use]
+pub fn opaque(block: u16) -> bool {
+    !SEE_THROUGH.contains(&(block >> 4))
+}
+
+/// Should this block be drawn at all yet?
+#[must_use]
+pub fn drawn(block: u16) -> bool {
+    block >> 4 != 0 && !PLANTS.contains(&(block >> 4))
+}
+
 /// The finished atlas, and where everything is in it.
 pub struct Atlas {
     pub width: u32,
