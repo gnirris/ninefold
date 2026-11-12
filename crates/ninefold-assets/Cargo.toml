@@ -1,0 +1,17 @@
+[package]
+name = "ninefold-assets"
+description = "Textures and sounds, from the player's own copy of the game or from ninefold's own pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[lints.clippy]
+all = "deny"

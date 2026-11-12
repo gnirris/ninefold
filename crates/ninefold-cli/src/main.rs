@@ -132,6 +132,32 @@ fn join(target: &str, name: &str) -> ExitCode {
         }
     }
 
+    // Mesh what the server actually sent us, and see where the artwork would come from.
+    {
+        use ninefold_mesh::Blocks;
+        struct World<'a>(&'a play::Session);
+        impl Blocks for World<'_> {
+            fn block(&self, x: i32, y: i32, z: i32) -> u16 {
+                self.0.block_at(x, y, z).unwrap_or(0)
+            }
+        }
+        let world = World(&session);
+        let (cx, cz) = (bx.div_euclid(16) * 16, bz.div_euclid(16) * 16);
+        let mut faces = 0;
+        let mut vertices = 0;
+        for section_y in 0..16 {
+            let mesh = ninefold_mesh::section(&world, (cx, section_y * 16, cz));
+            faces += mesh.faces();
+            vertices += mesh.vertices.len();
+        }
+        println!("meshed the column at x={cx} z={cz}: {faces} faces, {vertices} vertices");
+        let assets = ninefold_assets::pick(None);
+        println!("textures: {}", assets.describe());
+        if let Some(grass) = assets.texture("blocks/grass_top") {
+            println!("  blocks/grass_top is {}x{}", grass.width, grass.height);
+        }
+    }
+
     // Now walk with the real physics, a tick at a time, and see whether the server agrees.
     use ninefold_protocol::physics::{Body, Input, TPS};
     let mut body = Body {

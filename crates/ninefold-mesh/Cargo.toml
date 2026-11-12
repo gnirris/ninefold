@@ -1,0 +1,12 @@
+[package]
+name = "ninefold-mesh"
+description = "Turning 1.8 chunks into geometry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+all = "deny"

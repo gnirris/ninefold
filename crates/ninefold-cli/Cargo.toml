@@ -11,4 +11,6 @@ name = "ninefold"
 path = "src/main.rs"
 
 [dependencies]
+ninefold-assets = { path = "../ninefold-assets" }
+ninefold-mesh = { path = "../ninefold-mesh" }
 ninefold-protocol = { path = "../ninefold-protocol" }

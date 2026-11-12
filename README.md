@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — assets and meshing done, no window yet |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -103,6 +103,19 @@ sprinted 16.50 blocks in 3.0s = 5.500 blocks/second
   speed now 5.612 b/s, on ground true
   the server accepted every step
 ```
+
+## Where the artwork comes from
+
+ninefold ships no Minecraft assets and never will: the engine can be rewritten, the artwork
+cannot be redistributed. Nothing in the client opens a jar directly — it asks for
+`blocks/grass_top`, and an [`AssetSource`](crates/ninefold-assets) decides where that comes from:
+
+- your own copy of the game, read in place and nothing copied out of it, or
+- ninefold's own placeholder art, so the client still runs for someone who has no copy.
+
+That is the whole plug-and-play story. Installed, you get the game's look; not installed, you
+still get a game. Only the first needs you to own Minecraft, and the client never has to be
+started through the Java launcher — downloading a version is enough.
 
 ## Mods
 
