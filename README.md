@@ -106,7 +106,8 @@ sprinted 16.50 blocks in 3.0s = 5.500 blocks/second
 
 ![ninefold drawing a flat world from a real 1.8.9 server](docs/first-light.png)
 
-*A vanilla 1.8.9 server's world, decoded, meshed and drawn with the player's own textures.*
+*An ordinary 1.8.9 world — oak forest, 169 chunks, 1,071,688 vertices — decoded, meshed and drawn
+with the player's own textures.*
 
 ## Running it
 
@@ -121,6 +122,14 @@ take the mouse for looking, escape to give it back.
 
 The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
 so movement is identical at 30 frames a second or 300.
+
+## The block table
+
+65 entries covering what an overworld is actually made of, keyed by id and optionally by
+metadata so wool colours, wood types and stone variants sit on top of a default. Every texture
+name in it was checked against a real 1.8.9 jar rather than typed from memory, and a block with
+no entry draws a loud magenta tile so a gap is obvious instead of invisible. In a forest, 0.0% of
+the screen comes back magenta.
 
 ## The atlas
 
