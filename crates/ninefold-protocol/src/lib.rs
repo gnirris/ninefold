@@ -9,6 +9,7 @@
 //! an ID and four bits of metadata packed into a `u16`, not a block state; chunks are sent as
 //! fixed arrays, not a palette. Nothing here can be shared with a 1.13+ implementation.
 
+pub mod chunk;
 pub mod login;
 pub mod play;
 pub mod status;

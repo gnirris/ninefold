@@ -111,7 +111,26 @@ fn join(target: &str, name: &str) -> ExitCode {
         "placed at x={:.2} y={:.2} z={:.2}",
         start.x, start.y, start.z
     );
-    println!("chunks received: {}", session.chunks_seen);
+    println!(
+        "chunks received: {} ({} columns decoded)",
+        session.chunks_seen,
+        session.columns.len()
+    );
+
+    // The column under our feet, as decoded. On a flat world this is known ground truth.
+    let (bx, bz) = (start.x.floor() as i32, start.z.floor() as i32);
+    println!("the column at x={bx} z={bz}:");
+    for y in (0..6).rev() {
+        match session.block_at(bx, y, bz) {
+            Some(block) => println!(
+                "  y={y}  id {:<3} meta {}  {}",
+                block >> 4,
+                block & 0xF,
+                name_of(block >> 4)
+            ),
+            None => println!("  y={y}  (chunk not here)"),
+        }
+    }
 
     for _ in 0..10 {
         if let Err(e) = session.walk(0.5, 0.0) {
@@ -127,4 +146,16 @@ fn join(target: &str, name: &str) -> ExitCode {
     println!("walked {moved:.2} blocks east, still connected");
     println!("keep-alives answered: {}", session.keep_alives);
     ExitCode::SUCCESS
+}
+
+/// Enough 1.8 block names to read a flat world by eye.
+fn name_of(id: u16) -> &'static str {
+    match id {
+        0 => "air",
+        1 => "stone",
+        2 => "grass",
+        3 => "dirt",
+        7 => "bedrock",
+        _ => "?",
+    }
 }

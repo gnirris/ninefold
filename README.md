@@ -36,7 +36,7 @@ multi-year target, built in order of what can be proved:
 | Phase | | State |
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
-| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **in progress** — joins and walks; chunks not decoded yet |
+| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **in progress** — joins, decodes the world, walks; physics next |
 | 3 | Rendering: terrain meshing, entities, HUD | |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
@@ -55,6 +55,17 @@ logged in as ninefold (5d45374d-1452-3612-a52a-de8215caa576)
 joined: entity 0, gamemode 0, dimension 0, flat world, 5 player slots
 placed at x=1015.50 y=4.00 z=590.50
 walked 5.00 blocks east, still connected
+```
+
+The chunk decoder is checked against the one world whose contents are known in advance — a
+flat world is bedrock, dirt, dirt, grass, and that is what comes out:
+
+```
+the column at x=1025 z=590:
+  y=3  grass
+  y=2  dirt
+  y=1  dirt
+  y=0  bedrock
 ```
 
 The server agrees, which is the part that counts:

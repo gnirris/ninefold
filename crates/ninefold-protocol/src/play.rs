@@ -4,9 +4,11 @@
 //! and the two things it will drop you for ignoring — keep-alives, and confirming where you are.
 //! Chunks, entities and blocks come next.
 
+use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant};
 
+use crate::chunk::{self, Column};
 use crate::wire::{Connection, body};
 use crate::{Reader, Writer};
 
@@ -52,6 +54,8 @@ pub struct Session {
     pub placed: bool,
     pub chunks_seen: u32,
     pub keep_alives: u32,
+    /// Decoded columns, by chunk coordinate.
+    pub columns: HashMap<(i32, i32), Column>,
 }
 
 impl Session {
@@ -63,6 +67,7 @@ impl Session {
             placed: false,
             chunks_seen: 0,
             keep_alives: 0,
+            columns: HashMap::new(),
         }
     }
 
@@ -106,7 +111,26 @@ impl Session {
                 // Answering this is what tells the server the teleport took.
                 self.send_position()?;
             }
-            CHUNK_DATA | MAP_CHUNK_BULK => self.chunks_seen += 1,
+            CHUNK_DATA => {
+                self.chunks_seen += 1;
+                match chunk::read_chunk_data(&payload).map_err(bad)? {
+                    Some(column) => {
+                        self.columns.insert((column.x, column.z), column);
+                    }
+                    // A full column with no sections means the server is unloading it.
+                    None => {
+                        let mut r = Reader::new(&payload);
+                        let (x, z) = (r.i32().map_err(bad)?, r.i32().map_err(bad)?);
+                        self.columns.remove(&(x, z));
+                    }
+                }
+            }
+            MAP_CHUNK_BULK => {
+                for column in chunk::read_map_chunk_bulk(&payload).map_err(bad)? {
+                    self.chunks_seen += 1;
+                    self.columns.insert((column.x, column.z), column);
+                }
+            }
             DISCONNECT => {
                 let reason = Reader::new(&payload)
                     .string(64 * 1024)
@@ -156,6 +180,34 @@ impl Session {
             }
         }
         Ok(())
+    }
+}
+
+impl Session {
+    /// The block at a world position, if its chunk has arrived. `id << 4 | metadata`.
+    #[must_use]
+    pub fn block_at(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        if !(0..256).contains(&y) {
+            return None;
+        }
+        // Floor division: chunk -1 covers x -16..-1.
+        let column = self.columns.get(&(x.div_euclid(16), z.div_euclid(16)))?;
+        Some(column.block_at(
+            x.rem_euclid(16) as usize,
+            y as usize,
+            z.rem_euclid(16) as usize,
+        ))
+    }
+
+    /// The block the player is standing on.
+    #[must_use]
+    pub fn block_below(&self) -> Option<u16> {
+        let p = self.position;
+        self.block_at(
+            p.x.floor() as i32,
+            p.y.floor() as i32 - 1,
+            p.z.floor() as i32,
+        )
     }
 }
 
