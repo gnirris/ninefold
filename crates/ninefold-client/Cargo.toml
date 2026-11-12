@@ -1,0 +1,21 @@
+[package]
+name = "ninefold-client"
+description = "The windowed client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ninefold-client"
+path = "src/main.rs"
+
+[dependencies]
+ninefold-assets = { path = "../ninefold-assets" }
+ninefold-mesh = { path = "../ninefold-mesh" }
+ninefold-protocol = { path = "../ninefold-protocol" }
+ninefold-render = { path = "../ninefold-render" }
+winit = "0.30.13"
+
+[lints.clippy]
+all = "deny"

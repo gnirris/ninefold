@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — assets and meshing done, no window yet |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — window, camera and flat-shaded terrain; no texture atlas yet |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -103,6 +103,25 @@ sprinted 16.50 blocks in 3.0s = 5.500 blocks/second
   speed now 5.612 b/s, on ground true
   the server accepted every step
 ```
+
+![ninefold drawing a flat world from a real 1.8.9 server](docs/first-light.png)
+
+*First light: a vanilla 1.8.9 server's world, decoded, meshed and drawn. Flat colours averaged
+from the player's own textures — the atlas comes next.*
+
+## Running it
+
+```sh
+cargo run --release -p ninefold-cli    -- ping 127.0.0.1:25599        # what is this server
+cargo run --release -p ninefold-cli    -- join 127.0.0.1:25599 name   # headless: join, decode, walk
+cargo run --release -p ninefold-client -- 127.0.0.1:25599 name        # with a window
+```
+
+In the window: WASD to move, space to jump, left control to sprint, left shift to sneak, click to
+take the mouse for looking, escape to give it back.
+
+The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
+so movement is identical at 30 frames a second or 300.
 
 ## Where the artwork comes from
 

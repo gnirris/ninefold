@@ -173,8 +173,11 @@ fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16) {
             block,
         });
     }
+    // Wound so that (v1-v0) x (v2-v0) points the same way as the face does, which is what
+    // back-face culling needs. Reverse these and every block is drawn inside out: the world
+    // renders, and you are looking at the undersides of it.
     mesh.indices
-        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+        .extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
 }
 
 #[cfg(test)]
@@ -283,6 +286,41 @@ mod tests {
         let mut corners: Vec<_> = top.iter().map(|v| [v.position[0], v.position[2]]).collect();
         corners.dedup();
         assert_eq!(corners.len(), 4);
+    }
+
+    /// The bug this exists to catch: a face wound the wrong way round is invisible from outside
+    /// and visible from inside, so the world renders and looks wrong in a way that is very hard
+    /// to read from a screenshot.
+    #[test]
+    fn every_face_is_wound_to_match_the_way_it_points() {
+        let mesh = section(&OneBlock(0, 0, 0), (0, 0, 0));
+        assert_eq!(mesh.faces(), 6);
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let v: Vec<_> = triangle
+                .iter()
+                .map(|i| mesh.vertices[*i as usize])
+                .collect();
+            let edge = |a: usize, b: usize| {
+                [
+                    v[a].position[0] - v[b].position[0],
+                    v[a].position[1] - v[b].position[1],
+                    v[a].position[2] - v[b].position[2],
+                ]
+            };
+            let (u, w) = (edge(1, 0), edge(2, 0));
+            // Right-hand rule: this is the direction the triangle faces.
+            let wound = [
+                u[1] * w[2] - u[2] * w[1],
+                u[2] * w[0] - u[0] * w[2],
+                u[0] * w[1] - u[1] * w[0],
+            ];
+            let normal = v[0].normal;
+            let dot = wound[0] * normal[0] + wound[1] * normal[1] + wound[2] * normal[2];
+            assert!(
+                dot > 0.0,
+                "a face pointing {normal:?} is wound towards {wound:?} — it would be culled"
+            );
+        }
     }
 
     #[test]
