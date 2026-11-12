@@ -21,6 +21,7 @@ const MULTI_BLOCK_CHANGE: i32 = 0x22;
 const CHUNK_DATA: i32 = 0x21;
 const MAP_CHUNK_BULK: i32 = 0x26;
 const CHAT: i32 = 0x02;
+const RESPAWN: i32 = 0x07;
 const UPDATE_HEALTH: i32 = 0x06;
 const HELD_SLOT: i32 = 0x09;
 const DISCONNECT: i32 = 0x40;
@@ -132,6 +133,10 @@ pub struct Session {
     pub held: u8,
     /// Health has run out, and the server is waiting to be asked for a respawn.
     pub dead: bool,
+    /// Counts every time the server has moved us itself. Anything keeping its own copy of the
+    /// position — the physics, for one — has to notice this and snap to the new one, or it will
+    /// carry on from where it was and argue with the server about where the player is.
+    pub teleports: u32,
 }
 
 impl Session {
@@ -151,6 +156,7 @@ impl Session {
             food: 20,
             held: 0,
             dead: false,
+            teleports: 0,
         }
     }
 
@@ -191,6 +197,7 @@ impl Session {
                     pitch
                 };
                 self.placed = true;
+                self.teleports += 1;
                 // Answering this is what tells the server the teleport took.
                 self.send_position()?;
             }
@@ -215,6 +222,17 @@ impl Session {
                     let block = u16::try_from(r.var_int().map_err(bad)?).unwrap_or(0);
                     self.set_block(cx * 16 + x, y, cz * 16 + z, block);
                 }
+            }
+            RESPAWN => {
+                // A respawn can be into another dimension, so nothing already loaded is worth
+                // keeping: the chunks and everything in them belong to the world being left.
+                self.columns.clear();
+                self.dirty.clear();
+                self.entities.clear();
+                self.chunks_seen = 0;
+                self.placed = false;
+                self.dead = false;
+                self.health = 20.0;
             }
             CHAT => {
                 let mut r = Reader::new(&payload);

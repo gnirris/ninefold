@@ -111,6 +111,8 @@ struct App {
     breaking: Option<(raycast::Hit, f32)>,
     /// Is the left button down?
     swinging: bool,
+    /// The teleport count the physics has already followed.
+    followed_teleports: u32,
 }
 
 #[derive(Default)]
@@ -163,6 +165,7 @@ impl App {
             hitboxes: false,
             breaking: None,
             swinging: false,
+            followed_teleports: 0,
         }
     }
 
@@ -398,6 +401,28 @@ impl ApplicationHandler for App {
                     eprintln!("connection lost: {e}");
                     event_loop.exit();
                     return;
+                }
+                // The server has put us somewhere — respawned, teleported, pulled back after a
+                // move it did not like. Whatever the physics thought is now wrong.
+                if self.session.teleports != self.followed_teleports {
+                    self.followed_teleports = self.session.teleports;
+                    let p = self.session.position;
+                    self.body.x = p.x;
+                    self.body.y = p.y;
+                    self.body.z = p.z;
+                    self.body.motion_x = 0.0;
+                    self.body.motion_y = 0.0;
+                    self.body.motion_z = 0.0;
+                    self.body.on_ground = p.on_ground;
+                    self.previous = [p.x, p.y, p.z];
+                    // Chunks for the new place have not arrived; meshing starts over.
+                    if self.session.columns.is_empty() {
+                        for at in self.meshed.drain() {
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.remove_column(at);
+                            }
+                        }
+                    }
                 }
                 self.mesh_some();
 
