@@ -6,6 +6,7 @@
 //!
 //!   ninefold-client <host[:port]> [name]
 
+mod atlas;
 mod world;
 
 use std::time::{Duration, Instant};
@@ -52,9 +53,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = ninefold_assets::pick(None);
     println!("textures: {}", assets.describe());
 
+    let atlas = atlas::Atlas::build(assets.as_ref());
+    println!("atlas: {}x{} pixels", atlas.width, atlas.height);
+
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(session, world::Palette::from_assets(assets.as_ref()));
+    let mut app = App::new(session, atlas);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -63,7 +67,7 @@ struct App {
     window: Option<std::sync::Arc<Window>>,
     renderer: Option<ninefold_render::Renderer>,
     session: Session,
-    palette: world::Palette,
+    atlas: atlas::Atlas,
     body: Body,
     held: Held,
     yaw: f64,
@@ -87,7 +91,7 @@ struct Held {
 }
 
 impl App {
-    fn new(session: Session, palette: world::Palette) -> Self {
+    fn new(session: Session, atlas: atlas::Atlas) -> Self {
         let p = session.position;
         Self {
             window: None,
@@ -102,7 +106,7 @@ impl App {
             yaw: f64::from(p.yaw),
             pitch: f64::from(p.pitch),
             session,
-            palette,
+            atlas,
             held: Held::default(),
             owed: Duration::ZERO,
             last_frame: Instant::now(),
@@ -117,7 +121,7 @@ impl App {
             return;
         }
         self.chunks_when_meshed = self.session.columns.len();
-        let (vertices, indices) = world::geometry(&self.session, &self.palette);
+        let (vertices, indices) = world::geometry(&self.session, &self.atlas);
         if let Some(renderer) = &mut self.renderer {
             renderer.set_geometry(&vertices, &indices);
         }
@@ -172,6 +176,9 @@ impl ApplicationHandler for App {
                 event_loop.exit();
                 return;
             }
+        }
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_atlas(self.atlas.width, self.atlas.height, &self.atlas.rgba);
         }
         self.window = Some(window);
         self.remesh_if_needed();

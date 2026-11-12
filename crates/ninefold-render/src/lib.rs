@@ -16,7 +16,8 @@ use camera::Mat4;
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
-    pub colour: [f32; 3],
+    /// Where in the atlas, already in 0..1 atlas space.
+    pub uv: [f32; 2],
 }
 
 #[repr(C)]
@@ -33,29 +34,39 @@ struct Uniforms {
     sun: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var atlas: texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler: sampler;
 
 struct Out {
     @builtin(position) clip: vec4<f32>,
-    @location(0) shade: vec3<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) shade: f32,
 };
 
 @vertex
 fn vs(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) colour: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 ) -> Out {
     var out: Out;
     out.clip = u.view_projection * vec4<f32>(position, 1.0);
+    out.uv = uv;
     // Flat directional light with a floor, so faces away from the sun are shaded, not black.
     let lit = max(dot(normalize(normal), normalize(u.sun.xyz)), 0.0);
-    out.shade = colour * (0.45 + 0.55 * lit);
+    out.shade = 0.45 + 0.55 * lit;
     return out;
 }
 
 @fragment
 fn fs(in: Out) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.shade, 1.0);
+    let texel = textureSample(atlas, atlas_sampler, in.uv);
+    // Cutout, not blending: leaves and the like are either there or they are not, and this
+    // keeps them working without sorting anything back to front.
+    if texel.a < 0.5 {
+        discard;
+    }
+    return vec4<f32>(texel.rgb * in.shade, 1.0);
 }
 ";
 
@@ -67,7 +78,10 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Built once an atlas has been handed over; nothing can be drawn before that.
+    bind_group: Option<wgpu::BindGroup>,
     depth: wgpu::TextureView,
     geometry: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 }
@@ -127,24 +141,42 @@ impl Renderer {
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("uniforms"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("uniforms"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            }],
+        // Nearest filtering: Minecraft's textures are 16 pixels across and are meant to look it.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("atlas"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("world"),
@@ -160,7 +192,7 @@ impl Renderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -196,10 +228,60 @@ impl Renderer {
             config,
             pipeline,
             uniforms,
-            bind_group,
+            layout,
+            sampler,
+            bind_group: None,
             depth,
             geometry: None,
         })
+    }
+
+    /// Hand over the texture atlas. Everything drawn afterwards samples from it.
+    pub fn set_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("atlas"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("world"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        }));
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -307,9 +389,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some((vertices, indices, count)) = &self.geometry {
+            if let (Some((vertices, indices, count)), Some(bind_group)) =
+                (&self.geometry, &self.bind_group)
+            {
                 pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, Some(&self.bind_group), &[]);
+                pass.set_bind_group(0, Some(bind_group), &[]);
                 pass.set_vertex_buffer(0, vertices.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..*count, 0, 0..1);

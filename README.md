@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — window, camera and flat-shaded terrain; no texture atlas yet |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain; entities and HUD next |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -106,8 +106,7 @@ sprinted 16.50 blocks in 3.0s = 5.500 blocks/second
 
 ![ninefold drawing a flat world from a real 1.8.9 server](docs/first-light.png)
 
-*First light: a vanilla 1.8.9 server's world, decoded, meshed and drawn. Flat colours averaged
-from the player's own textures — the atlas comes next.*
+*A vanilla 1.8.9 server's world, decoded, meshed and drawn with the player's own textures.*
 
 ## Running it
 
@@ -122,6 +121,21 @@ take the mouse for looking, escape to give it back.
 
 The physics runs on its own 20 Hz clock rather than per frame, the way Minecraft's own loop does,
 so movement is identical at 30 frames a second or 300.
+
+## The atlas
+
+A draw call samples one texture, so every block face comes out of a single image of 16×16 tiles.
+Two of them are not simply copied in:
+
+- **grass_top** ships greyscale and is tinted by biome at draw time. Untinted, the whole world is
+  grey — which reads as a renderer bug and is not one.
+- **grass_side** is pre-coloured dirt with a separate cut-out, `grass_side_overlay`, carrying the
+  green. They are composited with the overlay tinted, which is where a grass block's green edge
+  comes from.
+
+Sampling is nearest-neighbour, because 1.8's textures are 16 pixels across and are meant to look
+it, and the fragment shader cuts out below half alpha rather than blending, so leaves and glass
+work without sorting anything back to front.
 
 ## Where the artwork comes from
 
