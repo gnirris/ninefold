@@ -19,6 +19,10 @@ impl Blocks for World<'_> {
     fn see_through(&self, x: i32, y: i32, z: i32) -> bool {
         !crate::atlas::opaque(self.block(x, y, z))
     }
+
+    fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.0.light_at(x, y, z)
+    }
 }
 
 /// Which way a face points, back from its normal. The mesher writes unit normals, so this is
@@ -51,6 +55,7 @@ pub fn column(session: &Session, atlas: &Atlas, at: (i32, i32)) -> (Vec<Vertex>,
             position: v.position,
             normal: v.normal,
             uv: atlas.uv(v.block, face_of(v.normal), v.uv),
+            light: v.light,
         }));
         indices.extend(mesh.indices.iter().map(|i| i + base));
     }

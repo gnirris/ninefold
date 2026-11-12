@@ -18,6 +18,8 @@ pub struct Vertex {
     pub normal: [f32; 3],
     /// Where in the atlas, already in 0..1 atlas space.
     pub uv: [f32; 2],
+    /// How lit this corner is, 0..1, straight from the server's light data.
+    pub light: f32,
 }
 
 #[repr(C)]
@@ -48,13 +50,18 @@ fn vs(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    @location(3) light: f32,
 ) -> Out {
     var out: Out;
     out.clip = u.view_projection * vec4<f32>(position, 1.0);
     out.uv = uv;
-    // Flat directional light with a floor, so faces away from the sun are shaded, not black.
-    let lit = max(dot(normalize(normal), normalize(u.sun.xyz)), 0.0);
-    out.shade = 0.45 + 0.55 * lit;
+    // Two things darken a face: which way it points, and how much light reaches it. The first
+    // is only for shape — without it every side of a cube looks identical.
+    let facing = max(dot(normalize(normal), normalize(u.sun.xyz)), 0.0);
+    let shape = 0.72 + 0.28 * facing;
+    // Never fully black: caves should be gloomy, not invisible.
+    let reached = 0.12 + 0.88 * light;
+    out.shade = shape * reached;
     return out;
 }
 
@@ -115,6 +122,53 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
 }
 ";
 
+/// A character of text, in clip space.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct Glyph {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+    pub colour: [f32; 4],
+}
+
+/// Text, drawn from Minecraft's own `ascii.png`.
+///
+/// That sheet is a 16x16 grid of 8x8 glyphs, white with an alpha cut-out, so the colour comes
+/// from the vertex and the sheet only says which pixels are on. Glyphs are drawn at a fixed
+/// width rather than the variable widths the real font uses: close enough for a debug readout,
+/// and no width table to carry.
+const TEXT_SHADER: &str = r"
+struct Out {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) colour: vec4<f32>,
+};
+@group(0) @binding(1) var font: texture_2d<f32>;
+@group(0) @binding(2) var font_sampler: sampler;
+
+@vertex
+fn vs(
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) colour: vec4<f32>,
+) -> Out {
+    var out: Out;
+    out.clip = vec4<f32>(position, 1.0);
+    out.uv = uv;
+    out.colour = colour;
+    return out;
+}
+
+@fragment
+fn fs(in: Out) -> @location(0) vec4<f32> {
+    let texel = textureSample(font, font_sampler, in.uv);
+    if texel.a < 0.5 {
+        discard;
+    }
+    return vec4<f32>(in.colour.rgb, in.colour.a);
+}
+";
+
 /// Everything needed to draw, tied to one window.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -136,6 +190,9 @@ pub struct Renderer {
     highlight: Option<(wgpu::Buffer, u32)>,
     entities: Option<(wgpu::Buffer, u32)>,
     crosshair_mesh: Option<(wgpu::Buffer, u32)>,
+    text: wgpu::RenderPipeline,
+    font: Option<wgpu::BindGroup>,
+    text_mesh: Option<(wgpu::Buffer, u32)>,
 }
 
 impl Renderer {
@@ -244,7 +301,7 @@ impl Renderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<Vertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32],
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -282,7 +339,7 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
         })];
-        let mut overlay_pipeline = |entry: &str, topology, depth: bool| {
+        let overlay_pipeline = |entry: &str, topology, depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("overlay"),
                 layout: Some(&pipeline_layout),
@@ -327,6 +384,46 @@ impl Renderer {
         let outline = overlay_pipeline("vs_world", wgpu::PrimitiveTopology::LineList, true);
         let crosshair = overlay_pipeline("vs_screen", wgpu::PrimitiveTopology::TriangleList, false);
 
+        let text_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("text"),
+            source: wgpu::ShaderSource::Wgsl(TEXT_SHADER.into()),
+        });
+        let text = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("text"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &text_shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Glyph>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4],
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &text_shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let depth = depth_view(&device, &config);
 
         let mut renderer = Self {
@@ -346,20 +443,29 @@ impl Renderer {
             highlight: None,
             entities: None,
             crosshair_mesh: None,
+            text,
+            font: None,
+            text_mesh: None,
         };
         renderer.build_crosshair();
         Ok(renderer)
     }
 
-    /// Hand over the texture atlas. Everything drawn afterwards samples from it.
-    pub fn set_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) {
+    /// Put pixels on the GPU and hand back something to sample from.
+    fn upload_texture(
+        &self,
+        label: &str,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> wgpu::TextureView {
         let size = wgpu::Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         };
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
+            label: Some(label),
             size,
             mip_level_count: 1,
             sample_count: 1,
@@ -378,7 +484,12 @@ impl Renderer {
             },
             size,
         );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    /// Hand over the texture atlas. Everything drawn afterwards samples from it.
+    pub fn set_atlas(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("atlas", width, height, rgba);
         self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world"),
             layout: &self.layout,
@@ -483,6 +594,92 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
         self.highlight = Some((buffer, u32::try_from(lines.len()).unwrap_or(0)));
+    }
+
+    /// Hand over the font sheet. Text can only be drawn once this has been called.
+    pub fn set_font(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        let view = self.upload_texture("font", width, height, rgba);
+        self.font = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("font"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        }));
+    }
+
+    /// Lay out lines of text from the top left, in pixels, and keep them for drawing.
+    pub fn set_text(&mut self, lines: &[(String, [f32; 4])]) {
+        use wgpu::util::DeviceExt;
+        /// How many screen pixels one font pixel takes.
+        const SCALE: f32 = 2.0;
+        const GLYPH: f32 = 8.0;
+        const MARGIN: f32 = 6.0;
+
+        if lines.is_empty() {
+            self.text_mesh = None;
+            return;
+        }
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        // Pixels to clip space, with y flipped: text is laid out downwards.
+        let to_clip = |x: f32, y: f32| [x / sw * 2.0 - 1.0, 1.0 - y / sh * 2.0, 0.0];
+        let cell = GLYPH * SCALE;
+
+        let mut glyphs = Vec::new();
+        for (row, (line, colour)) in lines.iter().enumerate() {
+            let top = MARGIN + row as f32 * (cell + 2.0);
+            for (column, character) in line.chars().enumerate() {
+                let code = if character.is_ascii() {
+                    character as u32
+                } else {
+                    b'?' as u32
+                };
+                if code == 32 {
+                    continue;
+                }
+                let (gx, gy) = ((code % 16) as f32 / 16.0, (code / 16) as f32 / 16.0);
+                let step = 1.0 / 16.0;
+                let left = MARGIN + column as f32 * cell;
+                let corners = [
+                    ([left, top], [gx, gy]),
+                    ([left + cell, top], [gx + step, gy]),
+                    ([left + cell, top + cell], [gx + step, gy + step]),
+                    ([left, top], [gx, gy]),
+                    ([left + cell, top + cell], [gx + step, gy + step]),
+                    ([left, top + cell], [gx, gy + step]),
+                ];
+                for ([px, py], uv) in corners {
+                    glyphs.push(Glyph {
+                        position: to_clip(px, py),
+                        uv,
+                        colour: *colour,
+                    });
+                }
+            }
+        }
+        if glyphs.is_empty() {
+            self.text_mesh = None;
+            return;
+        }
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("text"),
+                contents: bytemuck::cast_slice(&glyphs),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.text_mesh = Some((buffer, u32::try_from(glyphs.len()).unwrap_or(0)));
     }
 
     /// Draw a box round each thing in the world. Crude, but it is the difference between a
@@ -650,6 +847,13 @@ impl Renderer {
                     pass.set_vertex_buffer(0, shape.slice(..));
                     pass.draw(0..*count, 0..1);
                 }
+            }
+            // Text last, over everything, with the font bound in place of the block atlas.
+            if let (Some((glyphs, count)), Some(font)) = (&self.text_mesh, &self.font) {
+                pass.set_pipeline(&self.text);
+                pass.set_bind_group(0, Some(font), &[]);
+                pass.set_vertex_buffer(0, glyphs.slice(..));
+                pass.draw(0..*count, 0..1);
             }
         }
         self.queue.submit([encoder.finish()]);

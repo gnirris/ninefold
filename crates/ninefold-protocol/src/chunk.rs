@@ -23,6 +23,10 @@ pub const BIOME_BYTES: usize = 256;
 pub struct Section {
     /// `id << 4 | metadata`, indexed `y * 256 + z * 16 + x`.
     pub blocks: Vec<u16>,
+    /// Half a byte a block: torches, lava, glowstone.
+    pub block_light: Vec<u8>,
+    /// Half a byte a block, and only in the overworld: how much daylight reaches here.
+    pub sky_light: Option<Vec<u8>>,
 }
 
 impl Section {
@@ -30,6 +34,23 @@ impl Section {
     #[must_use]
     pub fn at(&self, x: usize, y: usize, z: usize) -> u16 {
         self.blocks[y * 256 + z * 16 + x]
+    }
+
+    /// The brighter of the two lights at a position, 0..15.
+    #[must_use]
+    pub fn light(&self, x: usize, y: usize, z: usize) -> u8 {
+        let at = y * 256 + z * 16 + x;
+        let nibble = |data: &[u8]| {
+            let byte = data.get(at / 2).copied().unwrap_or(0);
+            if at.is_multiple_of(2) {
+                byte & 0xF
+            } else {
+                byte >> 4
+            }
+        };
+        let block = nibble(&self.block_light);
+        let sky = self.sky_light.as_ref().map_or(0, |s| nibble(s));
+        block.max(sky)
     }
 
     /// Block id, without the metadata in the low four bits.
@@ -62,6 +83,19 @@ impl Column {
         }
     }
 
+    /// How bright it is at a position, 0..15. Unknown air counts as full daylight, so the sky
+    /// does not come out black.
+    #[must_use]
+    pub fn light_at(&self, x: usize, y: usize, z: usize) -> u8 {
+        if y >= SECTIONS * 16 {
+            return 15;
+        }
+        match &self.sections[y / 16] {
+            Some(section) => section.light(x, y % 16, z),
+            None => 15,
+        }
+    }
+
     /// Put a block into the column, growing an all-air section into existence if need be.
     pub fn set_block(&mut self, x: usize, y: usize, z: usize, block: u16) {
         if y >= SECTIONS * 16 {
@@ -75,6 +109,8 @@ impl Column {
             }
             *section = Some(Section {
                 blocks: vec![0; SECTION_BLOCKS],
+                block_light: vec![0; LIGHT_BYTES],
+                sky_light: Some(vec![0xFF; LIGHT_BYTES]),
             });
         }
         if let Some(section) = section {
@@ -130,12 +166,33 @@ pub fn column(
             let high = u16::from(r.u8()?);
             blocks.push(low | (high << 8));
         }
-        sections[*index] = Some(Section { blocks });
+        sections[*index] = Some(Section {
+            blocks,
+            block_light: Vec::new(),
+            sky_light: None,
+        });
     }
-    // Then the light, which nothing here uses yet but has to be stepped over to reach the biomes.
-    let light = present.len() * LIGHT_BYTES * if sky_light { 2 } else { 1 };
-    for _ in 0..light {
-        r.u8()?;
+    // Then every section's block light, then every section's sky light — grouped by kind, like
+    // the blocks were, not interleaved per section.
+    for index in &present {
+        let mut light = Vec::with_capacity(LIGHT_BYTES);
+        for _ in 0..LIGHT_BYTES {
+            light.push(r.u8()?);
+        }
+        if let Some(section) = &mut sections[*index] {
+            section.block_light = light;
+        }
+    }
+    if sky_light {
+        for index in &present {
+            let mut light = Vec::with_capacity(LIGHT_BYTES);
+            for _ in 0..LIGHT_BYTES {
+                light.push(r.u8()?);
+            }
+            if let Some(section) = &mut sections[*index] {
+                section.sky_light = Some(light);
+            }
+        }
     }
     let biomes = if ground_up {
         let mut out = Vec::with_capacity(BIOME_BYTES);
@@ -225,7 +282,7 @@ mod tests {
         for _ in 0..SECTION_BLOCKS {
             data.extend_from_slice(&fill.to_le_bytes());
         }
-        data.extend(std::iter::repeat_n(0u8, LIGHT_BYTES * 2)); // block light + sky light
+        data.extend(std::iter::repeat_n(0xFFu8, LIGHT_BYTES * 2)); // block light + sky light
         data.extend(std::iter::repeat_n(1u8, BIOME_BYTES));
         data
     }
@@ -287,7 +344,7 @@ mod tests {
         for _ in 0..SECTION_BLOCKS {
             data.extend_from_slice(&(1u16 << 4).to_le_bytes());
         }
-        data.extend(std::iter::repeat_n(0u8, LIGHT_BYTES));
+        data.extend(std::iter::repeat_n(0xFFu8, LIGHT_BYTES));
         let c = column(0, 0, 0b1, false, false, &data).unwrap();
         assert_eq!(c.solid_count(), SECTION_BLOCKS);
         assert!(c.biomes.is_none(), "no biomes without ground-up");

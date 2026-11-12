@@ -61,6 +61,9 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// `id << 4 | metadata`, so the renderer can look up which texture to use.
     pub block: u16,
+    /// How lit this face is, 0..1, taken from the block in front of it — which is the one the
+    /// light actually reaches, not the solid block the face belongs to.
+    pub light: f32,
 }
 
 /// Geometry for one chunk section.
@@ -93,6 +96,11 @@ pub trait Blocks {
     fn see_through(&self, x: i32, y: i32, z: i32) -> bool {
         self.block(x, y, z) >> 4 == 0
     }
+
+    /// How bright it is here, 0..15. Flat daylight unless something knows better.
+    fn light(&self, _x: i32, _y: i32, _z: i32) -> u8 {
+        15
+    }
 }
 
 /// Build the geometry for the 16×16×16 section whose corner is at `origin`.
@@ -112,7 +120,10 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
                     let (nx, ny, nz) = face.offset();
                     // A face is only worth drawing if you could see through what is next to it.
                     if world.see_through(x + nx, y + ny, z + nz) {
-                        push_face(&mut mesh, (x, y, z), face, block);
+                        // Light is sampled in front of the face: inside a solid block it is
+                        // always zero, which would make every surface black.
+                        let light = f32::from(world.light(x + nx, y + ny, z + nz)) / 15.0;
+                        push_face(&mut mesh, (x, y, z), face, block, light);
                     }
                 }
             }
@@ -122,7 +133,7 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
 }
 
 /// Add one quad, as two triangles.
-fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16) {
+fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16, light: f32) {
     let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
     // Corners, wound anticlockwise seen from outside, so back-face culling keeps the right ones.
     let corners: [[f32; 3]; 4] = match face {
@@ -171,6 +182,7 @@ fn push_face(mesh: &mut Mesh, at: (i32, i32, i32), face: Face, block: u16) {
             normal: face.normal(),
             uv,
             block,
+            light,
         });
     }
     // Wound so that (v1-v0) x (v2-v0) points the same way as the face does, which is what

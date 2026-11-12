@@ -20,6 +20,7 @@ const BLOCK_CHANGE: i32 = 0x23;
 const MULTI_BLOCK_CHANGE: i32 = 0x22;
 const CHUNK_DATA: i32 = 0x21;
 const MAP_CHUNK_BULK: i32 = 0x26;
+const CHAT: i32 = 0x02;
 const DISCONNECT: i32 = 0x40;
 const SPAWN_PLAYER: i32 = 0x0C;
 const SPAWN_MOB: i32 = 0x0F;
@@ -118,6 +119,8 @@ pub struct Session {
     pub dirty: std::collections::HashSet<(i32, i32)>,
     /// Everything else in the world, by the server's entity id.
     pub entities: HashMap<i32, Entity>,
+    /// What has been said, newest last.
+    pub chat: Vec<String>,
 }
 
 impl Session {
@@ -132,6 +135,7 @@ impl Session {
             columns: HashMap::new(),
             dirty: std::collections::HashSet::new(),
             entities: HashMap::new(),
+            chat: Vec::new(),
         }
     }
 
@@ -195,6 +199,18 @@ impl Session {
                     );
                     let block = u16::try_from(r.var_int().map_err(bad)?).unwrap_or(0);
                     self.set_block(cx * 16 + x, y, cz * 16 + z, block);
+                }
+            }
+            CHAT => {
+                let mut r = Reader::new(&payload);
+                let json = r.string(64 * 1024).map_err(bad)?;
+                let line = crate::status::chat_text(json);
+                if !line.trim().is_empty() {
+                    self.chat.push(line);
+                    // Only the last few are ever shown; the rest is just memory.
+                    if self.chat.len() > 64 {
+                        self.chat.drain(..self.chat.len() - 64);
+                    }
                 }
             }
             SPAWN_PLAYER => {
@@ -412,6 +428,23 @@ impl Session {
                 self.dirty.insert((at.0, at.1 + 1));
             }
         }
+    }
+
+    /// How bright it is at a world position, 0..15.
+    #[must_use]
+    pub fn light_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        if !(0..256).contains(&y) {
+            return 15;
+        }
+        self.columns
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+            .map_or(15, |column| {
+                column.light_at(
+                    x.rem_euclid(16) as usize,
+                    y as usize,
+                    z.rem_euclid(16) as usize,
+                )
+            })
     }
 
     /// The block the player is standing on.

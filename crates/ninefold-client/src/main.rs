@@ -59,7 +59,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(session, atlas);
+    // The font comes out of the same place as the block textures.
+    let font = assets.texture("font/ascii");
+    if font.is_none() {
+        println!("no font/ascii in the assets: the readout will be invisible");
+    }
+    let mut app = App::new(session, atlas, font);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -85,6 +90,12 @@ struct App {
     looking: bool,
     /// The block under the crosshair, if any.
     aimed: Option<raycast::Hit>,
+    /// Frames drawn since `counted_from`, for the readout.
+    frames: u32,
+    counted_from: Instant,
+    fps: f64,
+    /// The font sheet, kept until the renderer exists to take it.
+    font: Option<ninefold_assets::Texture>,
 }
 
 #[derive(Default)]
@@ -99,7 +110,7 @@ struct Held {
 }
 
 impl App {
-    fn new(session: Session, atlas: atlas::Atlas) -> Self {
+    fn new(session: Session, atlas: atlas::Atlas, font: Option<ninefold_assets::Texture>) -> Self {
         let p = session.position;
         Self {
             window: None,
@@ -122,6 +133,10 @@ impl App {
             meshed: std::collections::HashSet::new(),
             looking: false,
             aimed: None,
+            frames: 0,
+            counted_from: Instant::now(),
+            fps: 0.0,
+            font,
         }
     }
 
@@ -219,6 +234,9 @@ impl ApplicationHandler for App {
         }
         if let Some(renderer) = &mut self.renderer {
             renderer.set_atlas(self.atlas.width, self.atlas.height, &self.atlas.rgba);
+            if let Some(font) = &self.font {
+                renderer.set_font(font.width, font.height, &font.rgba);
+            }
         }
         self.window = Some(window);
         self.mesh_some();
@@ -320,6 +338,68 @@ impl ApplicationHandler for App {
                         if let Some(renderer) = &mut self.renderer {
                             renderer.set_highlight(aimed.map(|h| (h.x, h.y, h.z)));
                         }
+                    }
+                }
+
+                // The readout, and whatever has been said.
+                {
+                    self.frames += 1;
+                    let counted = self.counted_from.elapsed();
+                    if counted >= Duration::from_millis(500) {
+                        self.fps = f64::from(self.frames) / counted.as_secs_f64();
+                        self.frames = 0;
+                        self.counted_from = Instant::now();
+                    }
+                    let white = [1.0, 1.0, 1.0, 0.95];
+                    let dim = [0.75, 0.78, 0.85, 0.9];
+                    let mut lines = vec![
+                        (format!("ninefold {}", env!("CARGO_PKG_VERSION")), white),
+                        (
+                            format!(
+                                "xyz {:.1} {:.1} {:.1}   chunk {} {}",
+                                self.body.x,
+                                self.body.y,
+                                self.body.z,
+                                (self.body.x / 16.0).floor() as i32,
+                                (self.body.z / 16.0).floor() as i32
+                            ),
+                            dim,
+                        ),
+                        (
+                            format!(
+                                "{:.0} fps   {} chunks   {} entities",
+                                self.fps,
+                                self.meshed.len(),
+                                self.session.entities.len()
+                            ),
+                            dim,
+                        ),
+                        (
+                            match self.aimed {
+                                Some(hit) => {
+                                    let block =
+                                        self.session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
+                                    format!(
+                                        "looking at {} {} {}  id {} meta {}",
+                                        hit.x,
+                                        hit.y,
+                                        hit.z,
+                                        block >> 4,
+                                        block & 0xF
+                                    )
+                                }
+                                None => "looking at nothing".to_owned(),
+                            },
+                            dim,
+                        ),
+                    ];
+                    // The last few things said, oldest first, under the readout.
+                    let said = self.session.chat.len().saturating_sub(5);
+                    for line in &self.session.chat[said..] {
+                        lines.push((line.clone(), [1.0, 0.95, 0.7, 0.95]));
+                    }
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_text(&lines);
                     }
                 }
 

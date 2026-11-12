@@ -106,6 +106,18 @@ pub fn ping(host: &str, port: u16) -> io::Result<Status> {
     })
 }
 
+/// Flatten a chat component — or a plain string — into readable text, colour codes removed.
+///
+/// The same shape turns up in the server list ping, in chat and in disconnect reasons.
+#[must_use]
+pub fn chat_text(json: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(json) {
+        Ok(value) => motd_text(&value),
+        // Some servers send a bare string with no quotes in older paths.
+        Err(_) => strip_colours(json),
+    }
+}
+
 /// The description is a plain string on some servers and a chat component on others, and the
 /// component may nest `extra` parts without limit. Flatten whichever arrived and drop the
 /// §-colour codes.
