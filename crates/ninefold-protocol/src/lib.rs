@@ -9,6 +9,8 @@
 //! an ID and four bits of metadata packed into a `u16`, not a block state; chunks are sent as
 //! fixed arrays, not a palette. Nothing here can be shared with a 1.13+ implementation.
 
+pub mod login;
+pub mod play;
 pub mod status;
 pub mod wire;
 
@@ -67,6 +69,30 @@ impl<'a> Reader<'a> {
 
     pub fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes([self.u8()?, self.u8()?]))
+    }
+
+    pub fn bool(&mut self) -> Result<bool> {
+        Ok(self.u8()? != 0)
+    }
+
+    pub fn i8(&mut self) -> Result<i8> {
+        Ok(self.u8()? as i8)
+    }
+
+    pub fn i32(&mut self) -> Result<i32> {
+        let mut out = [0u8; 4];
+        for slot in &mut out {
+            *slot = self.u8()?;
+        }
+        Ok(i32::from_be_bytes(out))
+    }
+
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_bits(self.i32()? as u32))
+    }
+
+    pub fn f64(&mut self) -> Result<f64> {
+        Ok(f64::from_bits(self.i64()? as u64))
     }
 
     pub fn i64(&mut self) -> Result<i64> {
@@ -137,6 +163,24 @@ impl Writer {
 
     pub fn u16(&mut self, value: u16) -> &mut Self {
         self.bytes.extend_from_slice(&value.to_be_bytes());
+        self
+    }
+
+    pub fn bool(&mut self, value: bool) -> &mut Self {
+        self.u8(u8::from(value))
+    }
+
+    pub fn f32(&mut self, value: f32) -> &mut Self {
+        self.bytes_raw(&value.to_be_bytes())
+    }
+
+    pub fn f64(&mut self, value: f64) -> &mut Self {
+        self.bytes_raw(&value.to_be_bytes())
+    }
+
+    /// Bytes with no length in front, unlike [`Self::bytes`].
+    fn bytes_raw(&mut self, value: &[u8]) -> &mut Self {
+        self.bytes.extend_from_slice(value);
         self
     }
 

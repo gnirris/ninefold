@@ -12,9 +12,16 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("join") => match args.get(1) {
+            Some(target) => join(target, args.get(2).map_or("ninefold", String::as_str)),
+            None => {
+                eprintln!("usage: ninefold join <host[:port]> [name]");
+                ExitCode::from(2)
+            }
+        },
         _ => {
             eprintln!(
-                "ninefold {}\n\nusage:\n  ninefold ping <host[:port]>",
+                "ninefold {}\n\nusage:\n  ninefold ping <host[:port]>\n  ninefold join <host[:port]> [name]",
                 env!("CARGO_PKG_VERSION")
             );
             ExitCode::from(2)
@@ -57,4 +64,67 @@ fn split_target(target: &str) -> (&str, u16) {
         Some((host, port)) => (host, port.parse().unwrap_or(25565)),
         None => (target, 25565),
     }
+}
+
+/// Log in, get into the world, walk a few blocks, and report what happened.
+fn join(target: &str, name: &str) -> ExitCode {
+    use ninefold_protocol::play;
+    use std::time::Duration;
+
+    let (host, port) = split_target(target);
+    let (mut connection, profile) = match ninefold_protocol::login::login(host, port, name) {
+        Ok(ok) => ok,
+        Err(e) => {
+            eprintln!("could not log in to {host}:{port}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("logged in as {} ({})", profile.username, profile.uuid);
+    match profile.compression {
+        Some(t) => println!("  compression above {t} bytes"),
+        None => println!("  no compression"),
+    }
+
+    let joined = match play::read_join(&mut connection) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("never got Join Game: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "joined: entity {}, gamemode {}, dimension {}, {} world, {} player slots",
+        joined.entity_id, joined.gamemode, joined.dimension, joined.level_type, joined.max_players
+    );
+
+    let mut session = play::Session::new(connection);
+    if let Err(e) = session.settle(Duration::from_secs(15)) {
+        eprintln!("dropped while the world loaded: {e}");
+        return ExitCode::FAILURE;
+    }
+    if !session.placed {
+        eprintln!("the server never said where we are");
+        return ExitCode::FAILURE;
+    }
+    let start = session.position;
+    println!(
+        "placed at x={:.2} y={:.2} z={:.2}",
+        start.x, start.y, start.z
+    );
+    println!("chunks received: {}", session.chunks_seen);
+
+    for _ in 0..10 {
+        if let Err(e) = session.walk(0.5, 0.0) {
+            eprintln!("walking failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = session.step() {
+            eprintln!("dropped while walking: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let moved = session.position.x - start.x;
+    println!("walked {moved:.2} blocks east, still connected");
+    println!("keep-alives answered: {}", session.keep_alives);
+    ExitCode::SUCCESS
 }

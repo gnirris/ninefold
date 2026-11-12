@@ -35,13 +35,34 @@ multi-year target, built in order of what can be proved:
 
 | Phase | | State |
 |---|---|---|
-| 1 | Protocol 47: codec, handshake, status, login | **in progress** |
-| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | |
+| 1 | Protocol 47: codec, handshake, status, login | **done** |
+| 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **in progress** — joins and walks; chunks not decoded yet |
 | 3 | Rendering: terrain meshing, entities, HUD | |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
 tick trace either feels like 1.8 or it doesn't.
+
+## Testing against a real server
+
+Outbound 25565 is often filtered, and public servers rate-limit, so the honest test target is a
+local one: Mojang's own 1.8.9 server jar, `online-mode=false`, on a spare port. `ninefold join`
+then logs in, waits for the world and walks a few blocks:
+
+```
+logged in as ninefold (5d45374d-1452-3612-a52a-de8215caa576)
+  compression above 256 bytes
+joined: entity 0, gamemode 0, dimension 0, flat world, 5 player slots
+placed at x=1015.50 y=4.00 z=590.50
+walked 5.00 blocks east, still connected
+```
+
+The server agrees, which is the part that counts:
+
+```
+ninefold[/127.0.0.1:36038] logged in with entity id 0 at (1015.5, 4.0, 590.5)
+ninefold joined the game
+```
 
 ## Mods
 

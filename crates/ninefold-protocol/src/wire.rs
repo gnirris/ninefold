@@ -5,6 +5,8 @@
 //! once a whole packet is there — TCP will hand over half a packet, or three at once, and both
 //! have to work.
 
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -26,6 +28,10 @@ pub struct Connection {
     stream: TcpStream,
     /// Bytes read from the socket that have not yet become whole packets.
     buffered: Vec<u8>,
+    /// Set once the server sends Set Compression. Packets at least this many bytes are deflated;
+    /// smaller ones are sent as they are, with a zero where their uncompressed length would go.
+    /// `None` until then, which is why login has to be read before this is switched on.
+    compression: Option<usize>,
 }
 
 impl Connection {
@@ -45,7 +51,16 @@ impl Connection {
         Ok(Self {
             stream,
             buffered: Vec::new(),
+            compression: None,
         })
+    }
+
+    /// Switch on compression at the threshold the server asked for.
+    ///
+    /// Every packet after this one is framed differently, so it must be called between reading
+    /// Set Compression and reading anything else.
+    pub fn set_compression(&mut self, threshold: usize) {
+        self.compression = Some(threshold);
     }
 
     /// Write bytes that are already framed (the handshake builds its own).
@@ -55,7 +70,44 @@ impl Connection {
     }
 
     pub fn send(&mut self, id: i32, body: &[u8]) -> io::Result<()> {
-        self.stream.write_all(&frame(id, body))?;
+        let packet = match self.compression {
+            None => frame(id, body),
+            Some(threshold) => {
+                let mut data = Writer::new();
+                data.var_int(id);
+                let mut data = data.finish();
+                data.extend_from_slice(body);
+
+                let mut inner = Writer::new();
+                if data.len() >= threshold {
+                    // Deflated, and the length that goes in front is the *uncompressed* one.
+                    let mut deflate = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                    deflate.write_all(&data)?;
+                    let squashed = deflate.finish()?;
+                    inner.var_int(i32::try_from(data.len()).unwrap_or(i32::MAX));
+                    let mut inner = inner.finish();
+                    inner.extend_from_slice(&squashed);
+                    inner
+                } else {
+                    // Under the threshold: a zero, then the packet as it is.
+                    inner.var_int(0);
+                    let mut inner = inner.finish();
+                    inner.extend_from_slice(&data);
+                    inner
+                }
+            }
+        };
+        let packet = match self.compression {
+            None => packet,
+            Some(_) => {
+                let mut out = Writer::new();
+                out.var_int(i32::try_from(packet.len()).unwrap_or(i32::MAX));
+                let mut out = out.finish();
+                out.extend_from_slice(&packet);
+                out
+            }
+        };
+        self.stream.write_all(&packet)?;
         self.stream.flush()
     }
 
@@ -63,6 +115,7 @@ impl Connection {
     pub fn recv(&mut self) -> io::Result<(i32, Vec<u8>)> {
         loop {
             if let Some(packet) = self.take_packet()? {
+                let packet = self.decompress(packet)?;
                 let mut r = Reader::new(&packet);
                 let id = r.var_int().map_err(protocol_error)?;
                 return Ok((id, r.rest().to_vec()));
@@ -77,6 +130,40 @@ impl Connection {
             }
             self.buffered.extend_from_slice(&chunk[..read]);
         }
+    }
+
+    /// Undo the compression layer, if it is on.
+    ///
+    /// A zero uncompressed-length means the packet was under the threshold and was sent as it is;
+    /// anything else is deflated, and that number is how big it should come back.
+    fn decompress(&self, packet: Vec<u8>) -> io::Result<Vec<u8>> {
+        let Some(_) = self.compression else {
+            return Ok(packet);
+        };
+        let mut r = Reader::new(&packet);
+        let whole = r.var_int().map_err(protocol_error)?;
+        let rest = r.rest();
+        if whole == 0 {
+            return Ok(rest.to_vec());
+        }
+        let whole = usize::try_from(whole)
+            .ok()
+            .filter(|n| *n <= MAX_PACKET)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("inflated size {whole}"))
+            })?;
+        let mut out = Vec::with_capacity(whole);
+        ZlibDecoder::new(rest).read_to_end(&mut out)?;
+        if out.len() != whole {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "packet said it inflates to {whole} bytes, got {}",
+                    out.len()
+                ),
+            ));
+        }
+        Ok(out)
     }
 
     /// Split one whole packet off the front of the buffer, if there is one.
