@@ -10,11 +10,11 @@
 //! little cubes that blocks are drawn as in a slot) and the font.
 
 use ninefold_assets::{AssetSource, Texture};
-use ninefold_mesh::{Face, Shape};
+use ninefold_mesh::Face;
+use ninefold_mesh::shape::Baked;
 use ninefold_protocol::item::Slot;
 use ninefold_render::Glyph;
 
-use crate::atlas::Atlas;
 use crate::font::{self, Font};
 use crate::items::Items;
 
@@ -441,9 +441,9 @@ impl Ui {
     /// One item in a slot: its picture, or a little cube if it is a block, and its count.
     pub fn slot(&mut self, art: SlotArt<'_>, stack: Slot, x: f32, y: f32) {
         let SlotArt {
-            atlas,
             items,
             font,
+            shapes,
             light,
         } = art;
         if let Some(tile) = items.rect(stack.id, stack.damage) {
@@ -453,8 +453,10 @@ impl Ui {
                 [tile[0], tile[1], tile[0] + tile[2], tile[1] + tile[3]],
                 [light, light, light, 1.0],
             );
-        } else if let Some(block) = stack.as_block() {
-            self.block_icon(atlas, block, x, y, light);
+        } else if let Some(block) = stack.as_block()
+            && let Some(baked) = shapes.of(block)
+        {
+            self.block_icon(baked, x, y, light);
         }
         if stack.count > 1 {
             let count = stack.count.to_string();
@@ -463,24 +465,12 @@ impl Ui {
         }
     }
 
-    /// A block as it appears in a slot: three faces of a cube, seen from a corner.
+    /// A block as it appears in a slot: three faces of it, seen from a corner.
     ///
-    /// Vanilla really does render the block model in three dimensions here. Three flat
-    /// parallelograms with the block's own faces on them is the same picture for a full cube,
-    /// which is what almost every placeable block is.
-    pub fn block_icon(&mut self, atlas: &Atlas, block: u16, x: f32, y: f32, light: f32) {
+    /// Taken from the block's own shape rather than from a cube of its texture, so a slab in a
+    /// slot is a slab and a fence post is a post.
+    pub fn block_icon(&mut self, baked: &Baked, x: f32, y: f32, light: f32) {
         let s = 16.0;
-        // Anything that is not a cube is drawn flat, because a cube of it would be a lie.
-        if crate::atlas::shape_of(block) != Shape::Cube {
-            let tile = atlas.rect(block, Face::North);
-            self.quad(
-                Art::Blocks,
-                [x, y, s, s],
-                [tile[0], tile[1], tile[0] + tile[2], tile[1] + tile[3]],
-                [light, light, light, 1.0],
-            );
-            return;
-        }
         let (half, quarter) = (s / 2.0, s / 4.0);
         let top = [x + half, y];
         let right = [x + s, y + quarter];
@@ -489,17 +479,26 @@ impl Ui {
         let low_left = [x, y + quarter * 3.0];
         let bottom = [x + half, y + s];
         let low_right = [x + s, y + quarter * 3.0];
-        let square = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        // A face, its corners, and how much of the light it gets: the top is brightest, as it
-        // would be with the sun overhead.
-        for (face, points, shade) in [
+
+        // Which quad shows which side. A shape with no upward face — a pane, a torch — falls
+        // back to whatever it does have, so something is drawn.
+        let pick = |want: Face| {
+            baked
+                .quads
+                .iter()
+                .find(|quad| ninefold_mesh::face_of(quad.normal) == want)
+                .or_else(|| baked.quads.first())
+        };
+        for (want, points, shade) in [
             (Face::Up, [left, top, right, middle], 1.0),
             (Face::North, [left, middle, bottom, low_left], 0.65),
             (Face::East, [middle, right, low_right, bottom], 0.8),
         ] {
-            let uv = square.map(|corner| atlas.uv(block, face, corner));
+            let Some(quad) = pick(want) else {
+                continue;
+            };
             let value = light * shade;
-            self.shape(Art::Blocks, points, uv, [value, value, value, 1.0]);
+            self.shape(Art::Blocks, points, quad.uv, [value, value, value, 1.0]);
         }
     }
 
@@ -507,9 +506,7 @@ impl Ui {
     pub fn hud(&mut self, art: SlotArt<'_>, player: &Hud) {
         let (w, h) = self.size();
         let middle = w / 2.0;
-        let SlotArt {
-            atlas, items, font, ..
-        } = art;
+        let font = art.font;
 
         // Hotbar, centred along the bottom.
         let bar_x = middle - HOTBAR.w as f32 / 2.0;
@@ -592,17 +589,7 @@ impl Ui {
         for (index, stack) in player.hotbar.iter().enumerate() {
             if let Some(stack) = stack {
                 let x = bar_x + 3.0 + index as f32 * 20.0;
-                self.slot(
-                    SlotArt {
-                        atlas,
-                        items,
-                        font,
-                        light: 1.0,
-                    },
-                    *stack,
-                    x,
-                    bar_y + 3.0,
-                );
+                self.slot(SlotArt { light: 1.0, ..art }, *stack, x, bar_y + 3.0);
             }
         }
     }
@@ -619,11 +606,21 @@ pub enum Button {
 /// Everything needed to draw an item, bundled so the calls stay readable.
 #[derive(Clone, Copy)]
 pub struct SlotArt<'a> {
-    pub atlas: &'a Atlas,
     pub items: &'a Items,
     pub font: &'a Font,
+    /// The shapes of the blocks being drawn, so a slab in a slot looks like a slab.
+    pub shapes: &'a dyn BlockShapes,
     /// How bright to draw it: dimmed for a slot that is not really there.
     pub light: f32,
+}
+
+/// Where a slot's drawing gets a block's shape from.
+///
+/// A trait rather than the shape cache itself, because the cache needs the atlas to bake and
+/// the interface has no business knowing that.
+pub trait BlockShapes {
+    /// The shape of a block as it would be in the world, or `None` if it has none.
+    fn of(&self, block: u16) -> Option<&Baked>;
 }
 
 /// What the display needs to know about the player.
@@ -650,6 +647,38 @@ mod tests {
         }
         fn describe(&self) -> String {
             "test".into()
+        }
+    }
+
+    /// A stand-in shape cache: every block is the same cube.
+    struct Cubes(Baked);
+
+    impl Cubes {
+        fn new() -> Self {
+            let quads = Face::ALL
+                .iter()
+                .map(|side| ninefold_mesh::Quad {
+                    corners: [[0.0; 3]; 4],
+                    uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                    normal: side.normal(),
+                    cull: Some(*side),
+                    tint: 0,
+                    shade: true,
+                    boundary: true,
+                })
+                .collect();
+            Self(Baked {
+                quads,
+                solid: true,
+                collision: vec![([0.0; 3], [1.0; 3])],
+                ambient_occlusion: true,
+            })
+        }
+    }
+
+    impl BlockShapes for Cubes {
+        fn of(&self, block: u16) -> Option<&Baked> {
+            (block >> 4 != 0).then_some(&self.0)
         }
     }
 
@@ -696,13 +725,13 @@ mod tests {
 
     #[test]
     fn a_block_in_a_slot_is_three_faces_and_an_item_is_one() {
-        let atlas = Atlas::build(&Flat);
+        let shapes = Cubes::new();
         let items = Items::build(&Flat);
         let font = Font::measure(None);
         let art = SlotArt {
-            atlas: &atlas,
             items: &items,
             font: &font,
+            shapes: &shapes,
             light: 1.0,
         };
         let mut ui = screen();
@@ -718,13 +747,13 @@ mod tests {
 
     #[test]
     fn a_stack_of_one_has_no_number_on_it() {
-        let atlas = Atlas::build(&Flat);
+        let shapes = Cubes::new();
         let items = Items::build(&Flat);
         let font = Font::measure(None);
         let art = SlotArt {
-            atlas: &atlas,
             items: &items,
             font: &font,
+            shapes: &shapes,
             light: 1.0,
         };
         let mut ui = screen();
@@ -752,7 +781,7 @@ mod tests {
 
     #[test]
     fn the_hud_puts_the_hotbar_where_the_game_puts_it() {
-        let atlas = Atlas::build(&Flat);
+        let shapes = Cubes::new();
         let items = Items::build(&Flat);
         let font = Font::measure(None);
         let mut ui = screen();
@@ -760,9 +789,9 @@ mod tests {
         hotbar[0] = Some(Slot::new(1, 32));
         ui.hud(
             SlotArt {
-                atlas: &atlas,
                 items: &items,
                 font: &font,
+                shapes: &shapes,
                 light: 1.0,
             },
             &Hud {

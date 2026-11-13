@@ -177,25 +177,36 @@ Sampling is nearest-neighbour, because 1.8's textures are 16 pixels across and a
 it, and the fragment shader cuts out below half alpha rather than blending, so leaves and glass
 work without sorting anything back to front.
 
-## What is a cube, and what is not
+## What shape a block is
 
-Almost everything is a cube, which is the only reason a chunk renderer can be fast: a face is
-emitted only where the block next to it does not hide it, which takes a section from 24,576
-faces to a few hundred. Two decisions make that correct rather than merely fast.
+Almost nothing in Minecraft is a cube. Stairs, slabs, fences, panes, torches, doors, rails,
+carpets, snow layers, cakes and beds are not, and drawing them as cubes is the most obvious
+thing a reimplementation can get wrong — a fence becomes a wall, a torch a glowing block, a snow
+layer buries the grass it sits on. It is not only a rendering problem either: collision reads the
+same shapes, so a slab you cannot step onto is the same bug.
 
-**The list is of things that *are* cubes, not things that are not.** Every stair, slab, fence,
-pane, torch, rail, door, carpet and piece of redstone is not a full block, and anything left off
-a list of exceptions would wrongly hide its neighbours' faces. An unknown id erring towards
-visible costs a few extra faces; the other way round punches holes in the world.
+Those shapes are not written out here. The player's jar has them, and they are read from it:
+`blockstates/*.json` says which model a block state uses and how it is turned, and
+`models/block/*.json` says what the model is made of. **2744 of 2744 mapped block states resolve
+to real geometry**, needing 314 distinct textures. Three things that needs:
 
-**A block decides what hides *it*.** "Can you see through it" and "does it hide the face behind
-it" are different questions. Two leaf blocks are both see-through, and hiding the faces between
-them turns a canopy into a checkerboard you can see sky through. Two water blocks are also both
-see-through, and *not* hiding the faces between them fills an ocean with invisible geometry.
+- **Models inherit.** `stone_stairs` has no elements of its own; it takes them from `stairs`
+  through a `parent` chain and only fills in which textures go where.
+- **Textures are named, then resolved.** A face says `#side`, the model says `"side": "#all"`,
+  the parent says `"all": "blocks/stone"`. The chain has to be followed to the end.
+- **Variants are turned.** A stair facing west is the east-facing model with `"y": 180`, which
+  moves the boxes *and* renames the faces — move them without renaming and the step lands in the
+  right place with the wrong textures on it.
 
-Plants are the exception that cannot be skipped: grass, flowers, saplings, crops and sugar cane
-are two intersecting planes, drawn from both sides because back faces are culled and a flower
-that vanishes when you walk round it is worse than no flower.
+The one thing the jar cannot answer is which state a wire-format `id << 4 | metadata` means,
+because that mapping lived in the Java rather than in the assets. That part is written out:
+200-odd blocks, their metadata, and which blockstate file and variant key each one is.
+
+Culling then asks two questions, not one. A face is skipped only if its model names the
+neighbour that would hide it *and* that neighbour does — so a fence post keeps its own sides
+inside its block. And a block decides what hides *it*: two water blocks are one surface, while
+two leaf blocks are not, because hiding the faces between leaves turns a canopy into a
+checkerboard you can see the sky through.
 
 ## Mobs and players
 

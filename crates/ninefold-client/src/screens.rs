@@ -538,6 +538,15 @@ mod tests {
     use super::*;
     use ninefold_assets::{AssetSource, Texture};
 
+    /// A shape cache with nothing in it: the inventory layout does not depend on what the
+    /// blocks in it look like.
+    struct Nothing;
+    impl crate::gui::BlockShapes for Nothing {
+        fn of(&self, _block: u16) -> Option<&ninefold_mesh::shape::Baked> {
+            None
+        }
+    }
+
     struct Flat;
     impl AssetSource for Flat {
         fn texture(&self, _id: &str) -> Option<Texture> {
@@ -619,7 +628,6 @@ mod tests {
 
     #[test]
     fn clicking_the_inventory_lands_on_the_slot_under_the_mouse() {
-        let atlas = crate::atlas::Atlas::build(&Flat);
         let items = crate::items::Items::build(&Flat);
         let font = font();
         let mut ui = Ui::new(1280, 720);
@@ -627,9 +635,9 @@ mod tests {
         let hits = inventory(
             &mut ui,
             SlotArt {
-                atlas: &atlas,
                 items: &items,
                 font: &font,
+                shapes: &Nothing,
                 light: 1.0,
             },
             (&slots, None),

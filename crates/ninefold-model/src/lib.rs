@@ -23,6 +23,7 @@
 pub mod states;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ninefold_assets::AssetSource;
 use ninefold_mesh::Face;
@@ -97,17 +98,19 @@ struct Raw {
 }
 
 /// Reads and resolves models, keeping what it has already worked out.
-pub struct Models<'a> {
-    assets: &'a dyn AssetSource,
+pub struct Models {
+    /// Shared rather than borrowed: the client holds this for as long as it runs, and a borrow
+    /// would make everything that owns it self-referential.
+    assets: Arc<dyn AssetSource>,
     /// Model files, by name, as they were written.
     raw: HashMap<String, Raw>,
     /// Blockstate files, by name.
     states: HashMap<String, serde_json::Value>,
 }
 
-impl<'a> Models<'a> {
+impl Models {
     #[must_use]
-    pub fn new(assets: &'a dyn AssetSource) -> Self {
+    pub fn new(assets: Arc<dyn AssetSource>) -> Self {
         Self {
             assets,
             raw: HashMap::new(),
@@ -488,7 +491,7 @@ mod tests {
     #[test]
     fn a_model_takes_its_elements_from_its_parent_and_its_textures_from_itself() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let shape = models.shape("block/stone", (0, 0), false);
         assert_eq!(shape.boxes.len(), 1, "one box, inherited from block/cube");
         assert!(shape.solid, "a full cube hides its neighbours");
@@ -502,7 +505,7 @@ mod tests {
     #[test]
     fn a_slab_is_half_a_block_and_does_not_hide_what_is_next_to_it() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let shape = models.shape("block/half_slab_stone", (0, 0), false);
         let slab = &shape.boxes[0];
         assert_eq!(slab.to[1], 8.0, "half as tall");
@@ -514,7 +517,7 @@ mod tests {
     #[test]
     fn a_face_with_no_uv_takes_it_from_the_box() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let shape = models.shape("block/half_slab_stone", (0, 0), false);
         let (_, north) = shape.boxes[0]
             .faces
@@ -529,14 +532,14 @@ mod tests {
     #[test]
     fn turning_a_model_moves_the_boxes_and_renames_the_faces() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         // A box filling the east half of the block.
         let east_half = Written::new(&[(
             "models/block/step.json",
             r##"{"elements": [{"from": [8, 0, 0], "to": [16, 16, 16],
                 "faces": {"east": {"texture": "blocks/stone", "cullface": "east"}}}]}"##,
         )]);
-        let mut turned = Models::new(&east_half);
+        let mut turned = Models::new(Arc::new(east_half));
         let straight = turned.shape("block/step", (0, 0), false);
         assert_eq!(straight.boxes[0].from[0], 8.0);
         assert_eq!(straight.boxes[0].faces[0].0, Face::East);
@@ -563,7 +566,7 @@ mod tests {
     #[test]
     fn turning_about_x_puts_a_slab_on_the_ceiling() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let upside_down = models.shape("block/half_slab_stone", (180, 0), false);
         let slab = &upside_down.boxes[0];
         assert_eq!(slab.from[1], 8.0, "the slab is now the top half");
@@ -579,7 +582,7 @@ mod tests {
     #[test]
     fn a_blockstate_says_which_model_and_how_it_is_turned() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         assert_eq!(
             models.variant("stone_slab", "half=bottom"),
             Some(("block/half_slab_stone".to_owned(), (0, 0)))
@@ -593,7 +596,7 @@ mod tests {
     #[test]
     fn an_unknown_variant_falls_back_rather_than_vanishing() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let fallback = models.variant("stone_stairs", "facing=nowhere");
         assert!(fallback.is_some(), "a wrong shape beats no block");
     }
@@ -608,7 +611,7 @@ mod tests {
             panic!("no 1.8.9 jar in the usual places");
         };
         let vanilla = ninefold_assets::Vanilla::open(&jar).expect("open the jar");
-        let mut models = Models::new(&vanilla);
+        let mut models = Models::new(Arc::new(vanilla));
 
         let (mut mapped, mut resolved, mut empty) = (0, 0, Vec::new());
         let mut textures = std::collections::HashSet::new();
@@ -654,7 +657,7 @@ mod tests {
     #[test]
     fn a_model_that_is_not_there_is_an_empty_shape() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         assert!(models.shape("block/not_a_model", (0, 0), false).is_empty());
         assert!(models.variant("not_a_block", "x=1").is_none());
     }
@@ -665,14 +668,14 @@ mod tests {
             "models/block/loop.json",
             r##"{"parent": "block/loop", "textures": {"all": "blocks/stone"}}"##,
         )]);
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         assert!(models.shape("block/loop", (0, 0), false).is_empty());
     }
 
     #[test]
     fn every_texture_a_shape_needs_can_be_listed() {
         let source = models();
-        let mut models = Models::new(&source);
+        let mut models = Models::new(Arc::new(source));
         let shape = models.shape("block/half_slab_stone", (0, 0), false);
         let mut names: Vec<&str> = shape.textures().collect();
         names.sort_unstable();

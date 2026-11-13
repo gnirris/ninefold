@@ -9,6 +9,7 @@
 //! without a second winding convention to get wrong.
 
 use ninefold_mesh::Face;
+use ninefold_mesh::shape::Baked;
 use ninefold_protocol::item::Slot;
 use ninefold_render::{Sheet, Vertex};
 
@@ -110,15 +111,18 @@ impl Build {
         }
     }
 
+    /// A quad that samples a whole tile, its corners in the usual order.
     fn quad(&mut self, points: [[f32; 3]; 4], normal: [f32; 3], tile: [f32; 4], light: f32) {
+        let uv = CORNER_UV.map(|uv| [tile[0] + uv[0] * tile[2], tile[1] + uv[1] * tile[3]]);
+        self.corners(points, normal, uv, light);
+    }
+
+    /// A quad whose texture coordinates are already worked out, as a baked shape's are.
+    fn corners(&mut self, points: [[f32; 3]; 4], normal: [f32; 3], uv: [[f32; 2]; 4], light: f32) {
         let first = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
-        for (point, uv) in points.iter().zip(CORNER_UV) {
-            self.vertices.push(Vertex::plain(
-                *point,
-                normal,
-                [tile[0] + uv[0] * tile[2], tile[1] + uv[1] * tile[3]],
-                light,
-            ));
+        for (point, uv) in points.iter().zip(uv) {
+            self.vertices
+                .push(Vertex::plain(*point, normal, uv, light));
         }
         self.indices
             .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
@@ -200,7 +204,9 @@ fn swing_curves(swing: f32) -> (f32, f32) {
 
 /// Everything needed to draw whatever is in hand.
 pub struct Holding<'a> {
-    pub atlas: &'a Atlas,
+    /// The shape of the block in hand, if it is a block. Taken from the same models the world
+    /// uses, so a held slab is a slab.
+    pub shape: Option<&'a Baked>,
     pub items: &'a Items,
     /// Where the player's own skin is in the mob sheet, for an empty hand.
     pub skin: Option<models::Placed>,
@@ -231,6 +237,17 @@ impl Holding<'_> {
         (half_height * self.aspect.max(0.1), half_height)
     }
 
+    /// Where to put the middle of something so that it is in the corner and still on screen.
+    ///
+    /// `near` is how far away its closest part is, because the view narrows towards the camera;
+    /// `reach` is how far it sticks out sideways.
+    fn corner(&self, near: f32, reach: f32) -> (f32, f32) {
+        let (wide, tall) = self.visible(near.max(0.05));
+        (
+            ((wide - reach).max(0.0)) * TOWARDS_CORNER,
+            -((tall - reach).max(0.0)) * TOWARDS_CORNER,
+        )
+    }
 }
 
 /// Build the hand in front of the camera.
@@ -262,8 +279,9 @@ pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet)
         Step::Size(0.4),
     ];
 
-    let block = what.held.and_then(Slot::as_block);
-    if let Some(block) = block {
+    if what.held.and_then(Slot::as_block).is_some()
+        && let Some(shape) = what.shape
+    {
         // A block keeps its own shape: the model's first-person transform is another 45 degrees
         // and another four tenths, which is why a held block is small and seen corner-on.
         let steps: Vec<Step> = common
@@ -272,14 +290,22 @@ pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet)
             .chain([Step::Turn(1, 45.0), Step::Size(0.4)])
             .collect();
         let mut build = Build::new();
-        for face in Face::ALL {
-            let tile = what.atlas.rect(block, face);
-            let points = corners(face, [-0.5, -0.5, -0.5], [0.5, 0.5, 0.5])
-                .map(|point| basis.at(through(point, &steps)));
-            // A turned cube's faces point wherever the chain left them, so the normal is taken
+        for quad in &shape.quads {
+            // The shape is in block units from one corner; the transform chain turns things
+            // about their middle, so it is centred first.
+            let points = quad
+                .corners
+                .map(|corner| {
+                    through(
+                        [corner[0] - 0.5, corner[1] - 0.5, corner[2] - 0.5],
+                        &steps,
+                    )
+                })
+                .map(|point| basis.at(point));
+            // A turned shape's faces point wherever the chain left them, so the normal comes
             // from the geometry rather than from which face it started as.
             let normal = face_normal(points, basis);
-            build.quad(points, normal, tile, light);
+            build.corners(points, normal, quad.uv, light);
         }
         let (vertices, indices) = build.finish();
         return (vertices, indices, Sheet::Blocks);
@@ -323,23 +349,30 @@ pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet)
     let Some(skin) = what.skin else {
         return (Vec::new(), Vec::new(), Sheet::Mobs);
     };
+    let (arm_x, arm_y) = what.corner(DEPTH - 0.1, 0.09);
     let steps = [
         Step::Move([
             early * -0.3,
             (early * 2.0 * std::f32::consts::PI).sin() * 0.4,
             late * -0.4,
         ]),
-        Step::Move([across * 1.1, -0.62 - equip * 0.6, -DEPTH]),
+        // Vanilla's own offset here is a fixed 0.75 below the eye, which is further down than a
+        // 70-degree view reaches at this distance — the arm is cropped by the bottom of the
+        // screen in the real game too, but cropped to nothing is not the same as cropped.
+        Step::Move([arm_x * 1.05, arm_y - 0.08 - equip * 0.6, -DEPTH]),
         Step::Turn(1, 45.0),
         Step::Turn(1, early * 70.0),
         Step::Turn(2, late * -20.0),
-        // The arm is a quarter of a block across and three quarters long, in block units.
-        Step::Size(0.25),
+        // The arm is about a sixth of a block across and half a block long, in block units.
+        Step::Size(0.17),
     ];
     let tile = skin.patch([44.0, 20.0], [4.0, 12.0]);
     let mut build = Build::new();
     for face in Face::ALL {
-        let points = corners(face, [-0.5, -0.5, -0.5], [0.5, 0.5, 2.6])
+        // Reaching away from the camera, not towards it: local z is *back*, so the long end of
+        // the box is the negative one. The other way round puts the far end of the arm behind
+        // the near plane, where it fills the screen with one enormous sleeve.
+        let points = corners(face, [-0.5, -0.5, -2.6], [0.5, 0.5, 0.4])
             .map(|point| basis.at(through(point, &steps)));
         let normal = face_normal(points, basis);
         build.quad(points, normal, tile, light);
@@ -388,6 +421,33 @@ mod tests {
         Basis::new([0.0, 70.0, 0.0], [0.0, 0.0, 1.0])
     }
 
+    /// A plain cube, standing in for whatever the shape cache would hand over.
+    fn cube() -> Baked {
+        let quads = Face::ALL
+            .iter()
+            .map(|side| ninefold_mesh::Quad {
+                corners: [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [1.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ],
+                uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                normal: side.normal(),
+                cull: Some(*side),
+                tint: 0,
+                shade: true,
+                boundary: true,
+            })
+            .collect();
+        Baked {
+            quads,
+            solid: true,
+            collision: vec![([0.0; 3], [1.0; 3])],
+            ambient_occlusion: true,
+        }
+    }
+
     #[test]
     fn the_camera_axes_are_at_right_angles_and_right_handed() {
         for facing in [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.3, -0.8, 0.5]] {
@@ -404,13 +464,13 @@ mod tests {
 
     #[test]
     fn a_held_block_is_a_cube_in_front_of_the_camera() {
-        let atlas = Atlas::build(&Flat);
+        let cube = cube();
         let items = Items::build(&Flat);
         let basis = basis();
         let (vertices, indices, sheet) = held(
             &basis,
             &Holding {
-                atlas: &atlas,
+                shape: Some(&cube),
                 items: &items,
                 skin: None,
                 held: Some(Slot::new(4, 1)),
@@ -443,12 +503,12 @@ mod tests {
 
     #[test]
     fn an_item_is_flat_and_drawn_from_both_sides() {
-        let atlas = Atlas::build(&Flat);
+        let cube = cube();
         let items = Items::build(&Flat);
         let (_, indices, sheet) = held(
             &basis(),
             &Holding {
-                atlas: &atlas,
+                shape: Some(&cube),
                 items: &items,
                 skin: None,
                 held: Some(Slot::new(278, 1)),
@@ -465,13 +525,13 @@ mod tests {
 
     #[test]
     fn swinging_moves_the_hand() {
-        let atlas = Atlas::build(&Flat);
+        let cube = cube();
         let items = Items::build(&Flat);
         let hand = |swing| {
             held(
                 &basis(),
                 &Holding {
-                    atlas: &atlas,
+                    shape: Some(&cube),
                     items: &items,
                     skin: None,
                     held: Some(Slot::new(4, 1)),
@@ -497,7 +557,7 @@ mod tests {
 
     #[test]
     fn the_hand_is_in_the_corner_whatever_shape_the_window_is() {
-        let atlas = Atlas::build(&Flat);
+        let cube = cube();
         let items = Items::build(&Flat);
         // Vanilla holds things 0.52 below the eye at 0.72 away, and the view only reaches 0.50
         // at that distance — so the held item really is cropped by the bottom of the screen, and
@@ -507,7 +567,7 @@ mod tests {
             let (vertices, ..) = held(
                 &basis(),
                 &Holding {
-                    atlas: &atlas,
+                    shape: Some(&cube),
                     items: &items,
                     skin: None,
                     held: Some(Slot::new(4, 1)),
@@ -541,7 +601,7 @@ mod tests {
 
     #[test]
     fn cracks_wrap_the_block_they_are_on() {
-        let atlas = Atlas::build(&Flat);
+        let atlas = Atlas::build(&Flat, &["blocks/destroy_stage_4".to_owned()]);
         let (vertices, indices) = cracks(&atlas, (3, 64, -2), 4);
         assert_eq!(indices.len(), 36, "all six faces crack");
         for v in &vertices {
@@ -553,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_stage_that_does_not_exist_draws_nothing() {
-        let atlas = Atlas::build(&Flat);
+        let atlas = Atlas::build(&Flat, &[]);
         assert!(cracks(&atlas, (0, 0, 0), 99).1.is_empty());
     }
 }

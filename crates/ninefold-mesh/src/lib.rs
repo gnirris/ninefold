@@ -10,20 +10,9 @@
 //! into larger quads. Greedy meshing comes later, once there is something on screen to compare
 //! against.
 
-/// What a block is shaped like.
-///
-/// Almost everything is a cube, which is why a chunk renderer can be fast at all. The exception
-/// that cannot be skipped is the crossed sprite: grass, flowers, saplings, crops and dead bushes
-/// are two intersecting planes, and drawn as cubes they are unmistakably wrong — a flower
-/// becomes a solid block of petals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Shape {
-    Cube,
-    /// Two planes crossing on the diagonal.
-    Cross,
-    /// There but not drawn.
-    Invisible,
-}
+pub mod shape;
+
+pub use shape::{Baked, Quad};
 
 /// Which way a face points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,8 +73,9 @@ pub struct Vertex {
     pub normal: [f32; 3],
     /// Where in the texture, 0..1 on each axis.
     pub uv: [f32; 2],
-    /// `id << 4 | metadata`, so the renderer can look up which texture to use.
-    pub block: u16,
+    /// Which of the block colour maps applies to this corner, 0 for none. The texture is
+    /// already resolved into the uv, so the block id is no longer needed here.
+    pub tint: u8,
     /// Which block this corner belongs to. The position alone cannot say: a corner at x=3 is
     /// shared by the blocks at 2 and 3, and biome tinting has to know which one it came from.
     pub at: [i32; 3],
@@ -141,9 +131,12 @@ pub trait Blocks {
         15
     }
 
-    /// Cube unless something knows better.
-    fn shape(&self, _x: i32, _y: i32, _z: i32) -> Shape {
-        Shape::Cube
+    /// What this block is made of, or `None` for nothing to draw.
+    ///
+    /// Baked once per block state by the caller and handed back by reference, because this is
+    /// asked four thousand times a section.
+    fn baked(&self, _x: i32, _y: i32, _z: i32) -> Option<&Baked> {
+        None
     }
 }
 
@@ -203,33 +196,20 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
                 if block >> 4 == 0 {
                     continue;
                 }
-                match world.shape(x, y, z) {
-                    Shape::Invisible => continue,
-                    Shape::Cross => {
-                        // A sprite is lit by the air it stands in, not by a neighbour: there is
-                        // no face pressed against anything to take the light from.
-                        let light = f32::from(world.light(x, y, z)) / 15.0;
-                        push_cross(&mut mesh, (x, y, z), block, light.max(0.05));
-                        continue;
+                let Some(baked) = world.baked(x, y, z) else {
+                    continue;
+                };
+                for quad in &baked.quads {
+                    // A face is skipped only if it says which neighbour hides it and that
+                    // neighbour does. Everything else is drawn: a fence post's own sides have no
+                    // cullface and are visible from inside the block.
+                    if let Some(side) = quad.cull {
+                        let (nx, ny, nz) = side.offset();
+                        if world.covers(x + nx, y + ny, z + nz, block) {
+                            continue;
+                        }
                     }
-                    Shape::Cube => {}
-                }
-                for face in Face::ALL {
-                    let (nx, ny, nz) = face.offset();
-                    // A face is only worth drawing if what is next to it does not hide it.
-                    if !world.covers(x + nx, y + ny, z + nz, block) {
-                        // Light is sampled in front of the face: inside a solid block it is
-                        // always zero, which would make every surface black.
-                        let front = (x + nx, y + ny, z + nz);
-                        let (along, across) = face.corner_axes();
-                        let corners = [
-                            corner_light(world, front, neg(along), neg(across)),
-                            corner_light(world, front, along, neg(across)),
-                            corner_light(world, front, along, across),
-                            corner_light(world, front, neg(along), across),
-                        ];
-                        push_face(&mut mesh, (x, y, z), face, block, corners);
-                    }
+                    stamp(&mut mesh, world, (x, y, z), quad, baked.ambient_occlusion);
                 }
             }
         }
@@ -237,224 +217,302 @@ pub fn section(world: &impl Blocks, origin: (i32, i32, i32)) -> Mesh {
     mesh
 }
 
-/// Add one quad, as two triangles.
+/// Put one of a block's quads into the mesh at a block position.
+fn stamp(
+    mesh: &mut Mesh,
+    world: &impl Blocks,
+    at: (i32, i32, i32),
+    quad: &Quad,
+    ambient_occlusion: bool,
+) {
+    let (x, y, z) = at;
+    let face = face_of(quad.normal);
+    // Light comes from the air in front of a face, not from inside the solid block it belongs
+    // to — but only a face on the edge of its block has air in front of it. One inside the
+    // block, like a fence post's side, takes the block's own light instead.
+    let front = if quad.boundary {
+        let (nx, ny, nz) = face.offset();
+        (x + nx, y + ny, z + nz)
+    } else {
+        (x, y, z)
+    };
+    let corners = if ambient_occlusion && quad.boundary {
+        let (along, across) = face.corner_axes();
+        [
+            corner_light(world, front, neg(along), neg(across)),
+            corner_light(world, front, along, neg(across)),
+            corner_light(world, front, along, across),
+            corner_light(world, front, neg(along), across),
+        ]
+    } else {
+        let flat = f32::from(world.light(front.0, front.1, front.2)) / 15.0;
+        [flat; 4]
+    };
+    // A face that is not shaded by its direction is drawn at full brightness, as a torch is.
+    let normal = if quad.shade {
+        quad.normal
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+
+    let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
+    for ((corner, uv), light) in quad.corners.iter().zip(quad.uv).zip(corners) {
+        mesh.vertices.push(Vertex {
+            position: [
+                x as f32 + corner[0],
+                y as f32 + corner[1],
+                z as f32 + corner[2],
+            ],
+            normal,
+            uv,
+            tint: quad.tint,
+            at: [x, y, z],
+            light,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+}
+
+/// Which way a face points, from its normal.
+#[must_use]
+pub fn face_of(normal: [f32; 3]) -> Face {
+    match normal {
+        [_, y, _] if y > 0.5 => Face::Up,
+        [_, y, _] if y < -0.5 => Face::Down,
+        [x, _, _] if x > 0.5 => Face::East,
+        [x, _, _] if x < -0.5 => Face::West,
+        [_, _, z] if z > 0.5 => Face::South,
+        _ => Face::North,
+    }
+}
+
 const fn neg((x, y, z): (i32, i32, i32)) -> (i32, i32, i32) {
     (-x, -y, -z)
-}
-
-fn push_face(
-    mesh: &mut Mesh,
-    at: (i32, i32, i32),
-    face: Face,
-    block: u16,
-    corners_light: [f32; 4],
-) {
-    let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
-    let (x1, y1, z1) = (x + 1.0, y + 1.0, z + 1.0);
-    // Bottom left, bottom right, top right, top left — *as seen from outside the block*, which
-    // is the only ordering that puts a texture the right way up and the right way round. Getting
-    // this wrong does not stop anything rendering: it rotates the bark on a log by ninety
-    // degrees on two sides of it and mirrors it on the other two, which is exactly the kind of
-    // wrong that is easy to look straight past.
-    //
-    // Which corner is "bottom left" depends on where the viewer is. Standing north of a block
-    // and looking at its north face, world +x is on your left, so the bottom left corner is the
-    // one at maximum x — and that is why these are not simply the corners in order.
-    let corners: [[f32; 3]; 4] = match face {
-        Face::North => [[x1, y, z], [x, y, z], [x, y1, z], [x1, y1, z]],
-        Face::South => [[x, y, z1], [x1, y, z1], [x1, y1, z1], [x, y1, z1]],
-        Face::West => [[x, y, z], [x, y, z1], [x, y1, z1], [x, y1, z]],
-        Face::East => [[x1, y, z1], [x1, y, z], [x1, y1, z], [x1, y1, z1]],
-        // Seen from above with north at the top of the texture, which is how Minecraft lays out
-        // every top face.
-        Face::Up => [[x, y1, z1], [x1, y1, z1], [x1, y1, z], [x, y1, z]],
-        Face::Down => [[x, y, z], [x1, y, z], [x1, y, z1], [x, y, z1]],
-    };
-    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-    let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
-    for ((corner, uv), light) in corners.iter().zip(uvs).zip(corners_light) {
-        mesh.vertices.push(Vertex {
-            position: *corner,
-            normal: face.normal(),
-            uv,
-            block,
-            at: [at.0, at.1, at.2],
-            light,
-        });
-    }
-    // The corners run anticlockwise seen from outside, so the two triangles are the obvious
-    // ones. Reverse them and every block is drawn inside out: the world renders, and you are
-    // looking at the undersides of it.
-    mesh.indices
-        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
-}
-
-/// How far a crossed sprite's planes sit in from the block's edges.
-///
-/// Vanilla's cross model is 14.4 pixels wide across a 16-pixel block, rotated 45 degrees, which
-/// puts its corners a touch inside the block rather than exactly on them.
-const CROSS_INSET: f32 = 0.182;
-
-/// Two crossed planes, each drawn from both sides.
-///
-/// Both sides matter: back faces are culled, so one quad per plane would make a flower vanish
-/// when walked round.
-fn push_cross(mesh: &mut Mesh, at: (i32, i32, i32), block: u16, light: f32) {
-    let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
-    let (lo, hi) = (CROSS_INSET, 1.0 - CROSS_INSET);
-    let (bottom, top) = (y, y + 1.0);
-    let plane = |ax: f32, az: f32, bx: f32, bz: f32| {
-        [
-            [x + ax, bottom, z + az],
-            [x + bx, bottom, z + bz],
-            [x + bx, top, z + bz],
-            [x + ax, top, z + az],
-        ]
-    };
-    for corners in [plane(lo, lo, hi, hi), plane(hi, lo, lo, hi)] {
-        push_quad(mesh, at, corners, block, light);
-        // The same plane the other way round, so it is there from behind as well.
-        let [a, b, c, d] = corners;
-        push_quad(mesh, at, [b, a, d, c], block, light);
-    }
-}
-
-/// One quad, four corners, bottom left first.
-///
-/// Sprites are given an upward normal whatever way they face, because that is how vanilla draws
-/// them: a flower is not shaded darker for facing away from the sun, and all four of a sprite's
-/// quads sample the same texture, so nothing is lost by it.
-fn push_quad(mesh: &mut Mesh, at: (i32, i32, i32), corners: [[f32; 3]; 4], block: u16, light: f32) {
-    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-    let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
-    for (corner, uv) in corners.iter().zip(uvs) {
-        mesh.vertices.push(Vertex {
-            position: *corner,
-            normal: [0.0, 1.0, 0.0],
-            uv,
-            block,
-            at: [at.0, at.1, at.2],
-            light,
-        });
-    }
-    mesh.indices
-        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Nothing anywhere.
-    struct Void;
-    impl Blocks for Void {
-        fn block(&self, _x: i32, _y: i32, _z: i32) -> u16 {
-            0
+    /// The corners of one face of a unit cube, in the order a baker should produce them:
+    /// bottom left first, as seen from outside.
+    fn face_corners(side: Face) -> [[f32; 3]; 4] {
+        match side {
+            Face::North => [
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            Face::South => [
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.0, 1.0, 1.0],
+            ],
+            Face::West => [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [0.0, 1.0, 0.0],
+            ],
+            Face::East => [
+                [1.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ],
+            Face::Up => [
+                [0.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [1.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            Face::Down => [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
         }
     }
 
-    /// One stone block at the given spot.
-    struct OneBlock(i32, i32, i32);
-    impl Blocks for OneBlock {
-        fn block(&self, x: i32, y: i32, z: i32) -> u16 {
-            if (x, y, z) == (self.0, self.1, self.2) {
-                1 << 4
-            } else {
-                0
+    /// A full cube, every face culled by its own neighbour.
+    fn cube() -> Baked {
+        let quads = Face::ALL
+            .iter()
+            .map(|side| Quad {
+                corners: face_corners(*side),
+                uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                normal: side.normal(),
+                cull: Some(*side),
+                tint: 0,
+                shade: true,
+                boundary: true,
+            })
+            .collect();
+        Baked {
+            quads,
+            solid: true,
+            collision: vec![([0.0; 3], [1.0; 3])],
+            ambient_occlusion: true,
+        }
+    }
+
+    /// A post in the middle of its block: nothing culls it, and none of it touches the edges.
+    fn post() -> Baked {
+        let shrink = |corner: [f32; 3]| {
+            [
+                0.375 + corner[0] * 0.25,
+                corner[1],
+                0.375 + corner[2] * 0.25,
+            ]
+        };
+        let quads = Face::ALL
+            .iter()
+            .map(|side| Quad {
+                corners: face_corners(*side).map(shrink),
+                uv: [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                normal: side.normal(),
+                cull: None,
+                tint: 0,
+                shade: true,
+                boundary: false,
+            })
+            .collect();
+        Baked {
+            quads,
+            solid: false,
+            collision: vec![([0.375, 0.0, 0.375], [0.625, 1.0, 0.625])],
+            ambient_occlusion: true,
+        }
+    }
+
+    /// A world of one kind of block, with a shape per block id.
+    struct World {
+        blocks: Box<dyn Fn(i32, i32, i32) -> u16>,
+        cube: Baked,
+        post: Baked,
+    }
+
+    impl World {
+        fn new(blocks: impl Fn(i32, i32, i32) -> u16 + 'static) -> Self {
+            Self {
+                blocks: Box::new(blocks),
+                cube: cube(),
+                post: post(),
             }
         }
     }
 
-    /// Ground everywhere below `top`, like a flat world, going on forever sideways.
-    struct Ground {
-        top: i32,
-    }
-    impl Blocks for Ground {
-        fn block(&self, _x: i32, y: i32, _z: i32) -> u16 {
-            if y < self.top { 1 << 4 } else { 0 }
+    impl Blocks for World {
+        fn block(&self, x: i32, y: i32, z: i32) -> u16 {
+            (self.blocks)(x, y, z)
+        }
+        fn see_through(&self, x: i32, y: i32, z: i32) -> bool {
+            !matches!(self.block(x, y, z) >> 4, 1)
+        }
+        fn covers(&self, x: i32, y: i32, z: i32, _against: u16) -> bool {
+            self.block(x, y, z) >> 4 == 1
+        }
+        fn baked(&self, x: i32, y: i32, z: i32) -> Option<&Baked> {
+            match self.block(x, y, z) >> 4 {
+                1 => Some(&self.cube),
+                85 => Some(&self.post),
+                _ => None,
+            }
         }
     }
 
     #[test]
     fn empty_space_makes_no_geometry() {
-        let mesh = section(&Void, (0, 0, 0));
+        let mesh = section(&World::new(|_, _, _| 0), (0, 0, 0));
         assert!(mesh.is_empty());
         assert_eq!(mesh.faces(), 0);
     }
 
     #[test]
-    fn a_lone_block_has_all_six_faces() {
-        let mesh = section(&OneBlock(3, 4, 5), (0, 0, 0));
+    fn a_block_with_no_shape_is_not_drawn() {
+        // Id 99 has no baked shape in this world, so nothing comes out even though it is there.
+        let mesh = section(&World::new(|_, _, _| 99 << 4), (0, 0, 0));
+        assert!(mesh.is_empty());
+    }
+
+    #[test]
+    fn a_lone_cube_has_all_six_faces() {
+        let mesh = section(
+            &World::new(|x, y, z| if (x, y, z) == (3, 4, 5) { 1 << 4 } else { 0 }),
+            (0, 0, 0),
+        );
         assert_eq!(mesh.faces(), 6);
         assert_eq!(mesh.vertices.len(), 24, "four corners a face");
-        assert_eq!(mesh.indices.len(), 36, "six indices a face");
     }
 
     #[test]
-    fn two_blocks_side_by_side_hide_the_faces_between_them() {
-        struct Pair;
-        impl Blocks for Pair {
-            fn block(&self, x: i32, y: i32, z: i32) -> u16 {
-                if y == 0 && z == 0 && (x == 0 || x == 1) {
-                    1 << 4
-                } else {
-                    0
-                }
+    fn a_face_is_hidden_by_the_neighbour_it_names() {
+        let pair = World::new(|x, y, z| {
+            if y == 0 && z == 0 && (x == 0 || x == 1) {
+                1 << 4
+            } else {
+                0
             }
-        }
-        // Twelve faces in total, minus the two touching each other.
-        assert_eq!(section(&Pair, (0, 0, 0)).faces(), 10);
+        });
+        // Twelve faces, minus the two pressed against each other.
+        assert_eq!(section(&pair, (0, 0, 0)).faces(), 10);
     }
 
     #[test]
-    fn a_buried_block_is_not_drawn_at_all() {
-        // A section cut out of the middle of solid ground: every face has a neighbour.
-        let mesh = section(&Ground { top: 1000 }, (0, 0, 0));
-        assert_eq!(mesh.faces(), 0, "nothing is visible inside solid rock");
+    fn a_buried_cube_is_not_drawn_at_all() {
+        let solid = World::new(|_, _, _| 1 << 4);
+        assert_eq!(section(&solid, (0, 0, 0)).faces(), 0);
     }
 
     #[test]
-    fn flat_ground_shows_only_its_surface() {
-        // Ground up to y=4, so the section at y=0 has its top layer exposed and nothing else:
-        // the sides continue into the neighbouring chunks, which the mesher can see.
-        let mesh = section(&Ground { top: 4 }, (0, 0, 0));
-        assert_eq!(mesh.faces(), 16 * 16, "one face per column of the surface");
-        assert!(
-            mesh.vertices.iter().all(|v| v.normal == [0.0, 1.0, 0.0]),
-            "all of them pointing up"
-        );
-        assert!(
-            mesh.vertices.iter().all(|v| v.position[1] == 4.0),
-            "all at the top of the last solid block"
-        );
-    }
-
-    #[test]
-    fn a_face_is_a_unit_square_in_the_right_place() {
-        let mesh = section(&OneBlock(0, 0, 0), (0, 0, 0));
-        let top: Vec<_> = mesh
+    fn a_face_with_no_cullface_is_drawn_whatever_is_next_to_it() {
+        // A post surrounded by solid blocks still has all six of its faces, because none of them
+        // say what would hide them. Culling them is how a fence becomes an invisible fence.
+        let fenced = World::new(|x, y, z| {
+            if (x, y, z) == (0, 0, 0) {
+                85 << 4
+            } else {
+                1 << 4
+            }
+        });
+        let mesh = section(&fenced, (0, 0, 0));
+        // The stone around it contributes faces of its own, so only the post's are counted —
+        // every vertex records which block it came from.
+        let mine = mesh
             .vertices
             .iter()
-            .filter(|v| v.normal == [0.0, 1.0, 0.0])
-            .collect();
-        assert_eq!(top.len(), 4);
-        for v in &top {
-            assert_eq!(v.position[1], 1.0, "the top of a block at y=0 is y=1");
-            assert!((0.0..=1.0).contains(&v.position[0]));
-            assert!((0.0..=1.0).contains(&v.position[2]));
-        }
-        // The four corners are all different.
-        let mut corners: Vec<_> = top.iter().map(|v| [v.position[0], v.position[2]]).collect();
-        corners.dedup();
-        assert_eq!(corners.len(), 4);
+            .filter(|v| v.at == [0, 0, 0])
+            .count();
+        assert_eq!(mine, 24, "all six of the post's faces are there");
     }
 
-    /// The bug this exists to catch: a face wound the wrong way round is invisible from outside
+    #[test]
+    fn quads_land_at_the_block_they_belong_to() {
+        let mesh = section(
+            &World::new(|x, y, z| if (x, y, z) == (2, 3, 4) { 1 << 4 } else { 0 }),
+            (0, 0, 0),
+        );
+        for v in &mesh.vertices {
+            assert!((2.0..=3.0).contains(&v.position[0]), "{:?}", v.position);
+            assert!((3.0..=4.0).contains(&v.position[1]));
+            assert!((4.0..=5.0).contains(&v.position[2]));
+            assert_eq!(v.at, [2, 3, 4], "and know which block they came from");
+        }
+    }
+
+    /// The bug this exists to catch: a quad wound the wrong way round is invisible from outside
     /// and visible from inside, so the world renders and looks wrong in a way that is very hard
     /// to read from a screenshot.
     #[test]
     fn every_face_is_wound_to_match_the_way_it_points() {
-        let mesh = section(&OneBlock(0, 0, 0), (0, 0, 0));
+        let mesh = section(
+            &World::new(|x, y, z| if (x, y, z) == (0, 0, 0) { 1 << 4 } else { 0 }),
+            (0, 0, 0),
+        );
         assert_eq!(mesh.faces(), 6);
         for triangle in mesh.indices.as_chunks::<3>().0 {
             let v: Vec<_> = triangle
@@ -485,144 +543,119 @@ mod tests {
     }
 
     #[test]
-    fn a_sprite_is_four_quads_and_stays_inside_its_block() {
-        struct Flower;
-        impl Blocks for Flower {
+    fn a_normal_names_the_face_it_belongs_to() {
+        for face in Face::ALL {
+            assert_eq!(face_of(face.normal()), face, "{face:?} round trips");
+        }
+    }
+
+    #[test]
+    fn light_comes_from_in_front_of_a_face_and_not_from_inside_the_block() {
+        /// Pitch black everywhere except one cell, so where the light was read from is obvious.
+        struct Lit {
+            inner: World,
+        }
+        impl Blocks for Lit {
             fn block(&self, x: i32, y: i32, z: i32) -> u16 {
-                if (x, y, z) == (2, 3, 4) { 38 << 4 } else { 0 }
+                self.inner.block(x, y, z)
             }
-            fn see_through(&self, _x: i32, _y: i32, _z: i32) -> bool {
-                true
+            fn see_through(&self, x: i32, y: i32, z: i32) -> bool {
+                self.inner.see_through(x, y, z)
             }
-            fn shape(&self, x: i32, y: i32, z: i32) -> Shape {
-                if (x, y, z) == (2, 3, 4) {
-                    Shape::Cross
-                } else {
-                    Shape::Cube
-                }
+            fn covers(&self, x: i32, y: i32, z: i32, against: u16) -> bool {
+                self.inner.covers(x, y, z, against)
             }
-        }
-        let mesh = section(&Flower, (0, 0, 0));
-        assert_eq!(mesh.faces(), 4, "two planes, both sides of each");
-        for v in &mesh.vertices {
-            assert!(
-                (2.0..=3.0).contains(&v.position[0]) && (4.0..=5.0).contains(&v.position[2]),
-                "a sprite pokes out of its own block at {:?}",
-                v.position
-            );
-            assert!((3.0..=4.0).contains(&v.position[1]));
-        }
-        // Both facings are present, so it is visible from either side. A sprite's planes stand
-        // upright on the diagonal, so the direction they face is in x and z — checking the y of
-        // the cross product would say nothing at all.
-        let mut forwards = 0;
-        for triangle in mesh.indices.as_chunks::<3>().0 {
-            let v: Vec<_> = triangle.iter().map(|i| mesh.vertices[*i as usize]).collect();
-            let edge = |a: usize, b: usize| {
-                [
-                    v[a].position[0] - v[b].position[0],
-                    v[a].position[1] - v[b].position[1],
-                    v[a].position[2] - v[b].position[2],
-                ]
-            };
-            let (u, w) = (edge(1, 0), edge(2, 0));
-            let across = u[1] * w[2] - u[2] * w[1];
-            assert!(across.abs() > 1e-6, "a sprite's plane faces nowhere");
-            if across > 0.0 {
-                forwards += 1;
+            fn baked(&self, x: i32, y: i32, z: i32) -> Option<&Baked> {
+                self.inner.baked(x, y, z)
+            }
+            fn light(&self, _x: i32, y: i32, _z: i32) -> u8 {
+                // Bright above the block, dark at it and below.
+                if y > 0 { 15 } else { 0 }
             }
         }
-        assert_eq!(
-            forwards, 4,
-            "half the triangles face one way and half the other"
+        let world = Lit {
+            inner: World::new(|x, y, z| if (x, y, z) == (0, 0, 0) { 1 << 4 } else { 0 }),
+        };
+        let mesh = section(&world, (0, 0, 0));
+        let top: Vec<_> = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.normal == [0.0, 1.0, 0.0])
+            .collect();
+        assert!(
+            top.iter().all(|v| v.light > 0.5),
+            "the top face is lit by the air above it"
+        );
+        let bottom: Vec<_> = mesh
+            .vertices
+            .iter()
+            .filter(|v| v.normal == [0.0, -1.0, 0.0])
+            .collect();
+        assert!(
+            bottom.iter().all(|v| v.light < 0.5),
+            "and the underside is not"
         );
     }
 
     #[test]
-    fn an_invisible_block_makes_nothing() {
-        struct Hidden;
-        impl Blocks for Hidden {
+    fn an_interior_face_takes_the_light_of_its_own_block() {
+        struct Dark(World);
+        impl Blocks for Dark {
+            fn block(&self, x: i32, y: i32, z: i32) -> u16 {
+                self.0.block(x, y, z)
+            }
+            fn covers(&self, x: i32, y: i32, z: i32, against: u16) -> bool {
+                self.0.covers(x, y, z, against)
+            }
+            fn baked(&self, x: i32, y: i32, z: i32) -> Option<&Baked> {
+                self.0.baked(x, y, z)
+            }
+            fn light(&self, x: i32, _y: i32, _z: i32) -> u8 {
+                // Only the post's own column is lit.
+                if x == 0 { 15 } else { 0 }
+            }
+        }
+        let world = Dark(World::new(|x, y, z| {
+            if (x, y, z) == (0, 0, 0) { 85 << 4 } else { 0 }
+        }));
+        let mesh = section(&world, (0, 0, 0));
+        assert!(
+            mesh.vertices.iter().all(|v| v.light > 0.5),
+            "a post inside a lit block is lit, not dark from its neighbours"
+        );
+    }
+
+    #[test]
+    fn the_tint_rides_along_so_a_biome_can_colour_it() {
+        let mut leaves = cube();
+        for quad in &mut leaves.quads {
+            quad.tint = 2;
+        }
+        struct Tinted(Baked);
+        impl Blocks for Tinted {
             fn block(&self, _x: i32, _y: i32, _z: i32) -> u16 {
-                1 << 4
+                18 << 4
             }
-            fn see_through(&self, _x: i32, _y: i32, _z: i32) -> bool {
-                true
+            fn covers(&self, _x: i32, _y: i32, _z: i32, _against: u16) -> bool {
+                false
             }
-            fn shape(&self, _x: i32, _y: i32, _z: i32) -> Shape {
-                Shape::Invisible
-            }
-        }
-        assert!(section(&Hidden, (0, 0, 0)).is_empty());
-    }
-
-    /// The bug this exists to catch: a face whose corners are in the wrong order still renders,
-    /// still culls correctly and still has the right texture on it — it is just rotated or
-    /// mirrored. On stone nobody can tell. On a log, the bark runs sideways.
-    #[test]
-    fn a_texture_is_the_right_way_up_and_the_right_way_round() {
-        let mesh = section(&OneBlock(0, 0, 0), (0, 0, 0));
-        for face in Face::ALL {
-            let quad: Vec<_> = mesh
-                .vertices
-                .iter()
-                .filter(|v| v.normal == face.normal())
-                .collect();
-            assert_eq!(quad.len(), 4, "{face:?} should be one quad");
-            let at = |u: f32, v: f32| {
-                quad.iter()
-                    .find(|c| c.uv == [u, v])
-                    .unwrap_or_else(|| panic!("{face:?} has no corner at uv {u},{v}"))
-                    .position
-            };
-            let (bottom_left, bottom_right, top_left) = (at(0.0, 1.0), at(1.0, 1.0), at(0.0, 0.0));
-
-            // The top of the texture is the top of the face. On the up and down faces there is
-            // no "up": the top face has north at the top of the texture, as Minecraft lays them
-            // out, and the bottom face is its mirror because you are looking at it from under.
-            match face {
-                Face::Up => assert!(
-                    top_left[2] < bottom_left[2],
-                    "the top of a top face's texture should point north"
-                ),
-                Face::Down => assert!(
-                    top_left[2] > bottom_left[2],
-                    "a bottom face is the mirror of a top one, seen from below"
-                ),
-                _ => assert!(
-                    top_left[1] > bottom_left[1],
-                    "{face:?}: the texture is upside down"
-                ),
-            }
-
-            // And u increases to the right as seen from outside the block, which is up × normal.
-            let n = face.normal();
-            let right = [
-                1.0 * n[2] - 0.0 * n[1],
-                0.0 * n[0] - 0.0 * n[2],
-                0.0 * n[1] - 1.0 * n[0],
-            ];
-            let along = [
-                bottom_right[0] - bottom_left[0],
-                bottom_right[1] - bottom_left[1],
-                bottom_right[2] - bottom_left[2],
-            ];
-            let dot = along[0] * right[0] + along[1] * right[1] + along[2] * right[2];
-            if !matches!(face, Face::Up | Face::Down) {
-                assert!(dot > 0.0, "{face:?}: the texture is mirrored ({dot})");
+            fn baked(&self, x: i32, y: i32, z: i32) -> Option<&Baked> {
+                ((x, y, z) == (0, 0, 0)).then_some(&self.0)
             }
         }
+        let mesh = section(&Tinted(leaves), (0, 0, 0));
+        assert!(!mesh.is_empty());
+        assert!(mesh.vertices.iter().all(|v| v.tint == 2));
     }
 
     #[test]
-    fn metadata_rides_along_so_the_renderer_can_pick_a_texture() {
-        struct Wool;
-        impl Blocks for Wool {
-            fn block(&self, x: i32, _y: i32, _z: i32) -> u16 {
-                if x == 0 { (35 << 4) | 14 } else { 0 }
-            }
-        }
-        let mesh = section(&Wool, (0, 0, 0));
-        assert!(mesh.vertices.iter().all(|v| v.block >> 4 == 35));
-        assert!(mesh.vertices.iter().all(|v| v.block & 0xF == 14));
+    fn how_tall_a_shape_is_comes_from_what_you_collide_with() {
+        assert_eq!(cube().height(), 1.0);
+        let snow = Baked {
+            collision: vec![([0.0; 3], [1.0, 0.125, 1.0])],
+            ..Baked::default()
+        };
+        assert_eq!(snow.height(), 0.125, "one layer of snow");
+        assert_eq!(Baked::default().height(), 0.0, "nothing to stand on");
     }
 }

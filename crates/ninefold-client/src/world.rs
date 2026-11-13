@@ -1,54 +1,94 @@
 //! Turning what the server sent into something the GPU can draw.
+//!
+//! Two passes over a column, and the split is the point. The first works out which block states
+//! are in it and bakes any that have not been seen before; the second meshes, with every shape
+//! already in hand. Doing it in one pass would mean baking a model in the middle of the inner
+//! loop, which is both slow and impossible to borrow.
 
-use ninefold_mesh::{Blocks, Face, Shape};
+use ninefold_mesh::Blocks;
+use ninefold_mesh::shape::Baked;
+use ninefold_model::states::{self, Links};
 use ninefold_protocol::play::Session;
 use ninefold_render::Vertex;
 
-use crate::atlas::Atlas;
+use crate::atlas::{self, Atlas};
+use crate::shapes::Shapes;
 
 /// The decoded world, as the mesher wants to see it.
-struct World<'a>(&'a Session);
+struct World<'a> {
+    session: &'a Session,
+    shapes: &'a Shapes,
+}
+
+impl World<'_> {
+    fn at(&self, x: i32, y: i32, z: i32) -> u16 {
+        self.session.block_at(x, y, z).unwrap_or(0)
+    }
+}
 
 impl Blocks for World<'_> {
     fn block(&self, x: i32, y: i32, z: i32) -> u16 {
-        self.0.block_at(x, y, z).unwrap_or(0)
+        self.at(x, y, z)
     }
 
     fn see_through(&self, x: i32, y: i32, z: i32) -> bool {
-        !crate::atlas::opaque(self.block(x, y, z))
+        !self
+            .shapes
+            .get(self.at(x, y, z), links_of(self.session, (x, y, z)))
+            .is_some_and(|baked| baked.solid)
     }
 
     fn covers(&self, x: i32, y: i32, z: i32, against: u16) -> bool {
-        crate::atlas::covers(self.block(x, y, z), against)
+        let here = self.at(x, y, z);
+        let solid = self
+            .shapes
+            .get(here, links_of(self.session, (x, y, z)))
+            .is_some_and(|baked| baked.solid);
+        atlas::covers(here, against, solid)
     }
 
     fn light(&self, x: i32, y: i32, z: i32) -> u8 {
-        self.0.light_at(x, y, z)
+        self.session.light_at(x, y, z)
     }
 
-    fn shape(&self, x: i32, y: i32, z: i32) -> Shape {
-        crate::atlas::shape_of(self.block(x, y, z))
-    }
-}
-
-/// Which way a face points, back from its normal. The mesher writes unit normals, so this is
-/// exact rather than a nearest match.
-fn face_of(normal: [f32; 3]) -> Face {
-    match normal {
-        [_, y, _] if y > 0.5 => Face::Up,
-        [_, y, _] if y < -0.5 => Face::Down,
-        [x, _, _] if x > 0.5 => Face::East,
-        [x, _, _] if x < -0.5 => Face::West,
-        [_, _, z] if z > 0.5 => Face::South,
-        _ => Face::North,
+    fn baked(&self, x: i32, y: i32, z: i32) -> Option<&Baked> {
+        let block = self.at(x, y, z);
+        if block >> 4 == 0 {
+            return None;
+        }
+        // A block with no model of its own is drawn as a plain cube rather than not at all, so a
+        // gap in the state table is loud instead of invisible.
+        self.shapes
+            .get(block, links_of(self.session, (x, y, z)))
+            .or_else(|| Some(self.shapes.fallback()))
     }
 }
 
-/// How far a grass block's green fringe sits outside the dirt underneath it.
+/// Which neighbours a fence, pane or wall is joined to.
 ///
-/// It has to be something: the overlay is a second quad in exactly the same place as the side it
-/// covers, and two quads at the same depth flicker against each other as the camera moves.
-const OVERLAY_LIFT: f32 = 0.002;
+/// Anything you cannot walk through counts, and so does another connecting block — which is what
+/// makes a fence meet a wall and a pane meet a block of glass. Asking the neighbour for its own
+/// shape would be the exact answer and would also ask the neighbour about *its* neighbours, so
+/// this uses the cheap test instead.
+#[must_use]
+pub fn links_of(session: &Session, at: (i32, i32, i32)) -> Links {
+    let (x, y, z) = at;
+    let block = session.block_at(x, y, z).unwrap_or(0);
+    if !states::connects(block) {
+        return Links::default();
+    }
+    let joins = |dx: i32, dz: i32| {
+        let neighbour = session.block_at(x + dx, y, z + dz).unwrap_or(0);
+        neighbour >> 4 != 0
+            && (ninefold_protocol::blocks::solid(neighbour) || states::connects(neighbour))
+    };
+    Links {
+        north: joins(0, -1),
+        south: joins(0, 1),
+        west: joins(-1, 0),
+        east: joins(1, 0),
+    }
+}
 
 /// Mesh one chunk column, with atlas coordinates and biome colours on every corner.
 ///
@@ -56,64 +96,50 @@ const OVERLAY_LIFT: f32 = 0.002;
 /// walk, and rebuilding the whole world each time is what made this stutter and made terrain
 /// blink out while it worked.
 #[must_use]
-pub fn column(session: &Session, atlas: &Atlas, at: (i32, i32)) -> (Vec<Vertex>, Vec<u32>) {
-    let world = World(session);
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    // Every quad the mesher emits is four consecutive vertices, so a face can be read back out
-    // of the mesh in groups of four — which is what the overlay pass needs.
-    for section_y in 0..16 {
-        let mesh = ninefold_mesh::section(&world, (at.0 * 16, section_y * 16, at.1 * 16));
-        for quad in mesh.vertices.as_chunks::<4>().0 {
-            let block = quad[0].block;
-            let [bx, _, bz] = quad[0].at;
-            let face = face_of(quad[0].normal);
-            let tint = atlas
-                .tint_of(block)
-                .map_or([1.0, 1.0, 1.0], |tint| {
-                    atlas.biome_colour(tint, session.biome_at(bx, bz))
-                });
-            push(&mut vertices, &mut indices, quad.map(|v| Vertex {
-                position: v.position,
-                normal: v.normal,
-                uv: atlas.uv(block, face, v.uv),
-                tint,
-                light: v.light,
-            }));
-
-            // Grass is dirt with a green edge laid over its sides, which is two quads in
-            // vanilla as well: the fringe has to be biome-coloured while the dirt must not be.
-            if matches!(
-                face,
-                Face::North | Face::South | Face::East | Face::West
-            ) && let Some((tile, kind)) = atlas.overlay_of(block)
-            {
-                let colour = atlas.biome_colour(kind, session.biome_at(bx, bz));
-                let normal = quad[0].normal;
-                push(&mut vertices, &mut indices, quad.map(|v| Vertex {
-                    position: [
-                        v.position[0] + normal[0] * OVERLAY_LIFT,
-                        v.position[1] + normal[1] * OVERLAY_LIFT,
-                        v.position[2] + normal[2] * OVERLAY_LIFT,
-                    ],
-                    normal,
-                    uv: Atlas::uv_in(tile, v.uv),
-                    tint: colour,
-                    light: v.light,
-                }));
+pub fn column(
+    session: &Session,
+    atlas: &Atlas,
+    shapes: &mut Shapes,
+    at: (i32, i32),
+) -> (Vec<Vertex>, Vec<u32>) {
+    // Everything in the column, and a block of margin all round it: culling asks the
+    // neighbours whether they are solid, and a neighbour in the next column over has to have
+    // been baked for that question to have an answer.
+    for x in (at.0 * 16 - 1)..(at.0 * 16 + 17) {
+        for z in (at.1 * 16 - 1)..(at.1 * 16 + 17) {
+            for y in 0..256 {
+                let block = session.block_at(x, y, z).unwrap_or(0);
+                if block >> 4 == 0 {
+                    continue;
+                }
+                shapes.prepare(atlas, block, links_of(session, (x, y, z)));
             }
         }
     }
-    (vertices, indices)
-}
 
-/// Add one quad and the two triangles that draw it.
-///
-/// The winding matches the mesher's: reverse it and every face is culled.
-fn push(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, quad: [Vertex; 4]) {
-    let first = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
-    vertices.extend_from_slice(&quad);
-    indices.extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+    let world = World { session, shapes };
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for section_y in 0..16 {
+        let mesh = ninefold_mesh::section(&world, (at.0 * 16, section_y * 16, at.1 * 16));
+        let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+        vertices.extend(mesh.vertices.iter().map(|v| {
+            // The tint is a number on the vertex; which colour that number means depends on the
+            // biome the block is standing in, which is why it cannot be baked into the atlas.
+            let tint = atlas::Tint::from_code(v.tint).map_or([1.0, 1.0, 1.0], |tint| {
+                atlas.biome_colour(tint, session.biome_at(v.at[0], v.at[2]))
+            });
+            Vertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+                tint,
+                light: v.light,
+            }
+        }));
+        indices.extend(mesh.indices.iter().map(|i| i + base));
+    }
+    (vertices, indices)
 }
 
 #[cfg(test)]
@@ -121,46 +147,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_normal_names_the_face_it_belongs_to() {
-        for face in Face::ALL {
-            assert_eq!(face_of(face.normal()), face, "{face:?} round trips");
-        }
+    fn only_the_blocks_that_join_up_look_at_their_neighbours() {
+        // A stone block is never "joined" to anything, however much stone is round it.
+        assert!(!states::connects(1 << 4));
+        assert!(states::connects(85 << 4), "a fence is");
     }
 
     #[test]
-    fn a_quads_triangles_face_the_way_the_quad_does() {
-        // The same check the mesher makes, on the indices this module writes rather than the
-        // ones it writes: they have to agree or every face is culled.
-        let corner = |position: [f32; 3]| Vertex::plain(position, [0.0, 0.0, -1.0], [0.0, 0.0], 1.0);
-        // The corner order the mesher emits for a north-facing quad, which is the order the
-        // index list below is written for.
-        let quad = [
-            corner([1.0, 0.0, 0.0]),
-            corner([0.0, 0.0, 0.0]),
-            corner([0.0, 1.0, 0.0]),
-            corner([1.0, 1.0, 0.0]),
-        ];
-        let (mut vertices, mut indices) = (Vec::new(), Vec::new());
-        push(&mut vertices, &mut indices, quad);
-        assert_eq!(indices.len(), 6);
-        for triangle in indices.as_chunks::<3>().0 {
-            let v: Vec<_> = triangle.iter().map(|i| vertices[*i as usize]).collect();
-            let edge = |a: usize, b: usize| {
-                [
-                    v[a].position[0] - v[b].position[0],
-                    v[a].position[1] - v[b].position[1],
-                    v[a].position[2] - v[b].position[2],
-                ]
-            };
-            let (u, w) = (edge(1, 0), edge(2, 0));
-            let wound = [
-                u[1] * w[2] - u[2] * w[1],
-                u[2] * w[0] - u[0] * w[2],
-                u[0] * w[1] - u[1] * w[0],
-            ];
-            let n = v[0].normal;
-            let dot = wound[0] * n[0] + wound[1] * n[1] + wound[2] * n[2];
-            assert!(dot > 0.0, "wound {wound:?} against normal {n:?}");
-        }
+    fn a_tint_number_becomes_a_colour_and_no_number_means_no_colour() {
+        assert_eq!(atlas::Tint::from_code(0), None);
+        assert_eq!(
+            atlas::Tint::from_code(atlas::Tint::Grass.code()),
+            Some(atlas::Tint::Grass)
+        );
     }
 }

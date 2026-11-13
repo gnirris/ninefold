@@ -176,14 +176,17 @@ fn colour_for(id: &str) -> [u8; 4] {
 }
 
 /// Use the real artwork if a jar is there, and ninefold's own if not.
+///
+/// Shared rather than boxed, because the model reader keeps it for the life of the program and a
+/// borrow would make everything holding one self-referential.
 #[must_use]
-pub fn pick(jar: Option<&Path>) -> Box<dyn AssetSource> {
+pub fn pick(jar: Option<&Path>) -> std::sync::Arc<dyn AssetSource> {
     let found = jar
         .map(Path::to_path_buf)
         .or_else(|| Vanilla::usual_places().into_iter().next());
     match found.as_deref().map(Vanilla::open) {
-        Some(Ok(vanilla)) => Box::new(vanilla),
-        Some(Err(_)) | None => Box::new(Fallback),
+        Some(Ok(vanilla)) => std::sync::Arc::new(vanilla),
+        Some(Err(_)) | None => std::sync::Arc::new(Fallback),
     }
 }
 

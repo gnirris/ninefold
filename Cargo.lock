@@ -1086,6 +1086,7 @@ version = "0.0.1"
 dependencies = [
  "ninefold-assets",
  "ninefold-mesh",
+ "ninefold-model",
  "ninefold-mods",
  "ninefold-protocol",
  "ninefold-render",

@@ -20,6 +20,7 @@ mod items;
 mod models;
 mod screens;
 mod settings;
+mod shapes;
 mod sound;
 mod world;
 
@@ -71,8 +72,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let assets = ninefold_assets::pick(None);
     println!("textures: {}", assets.describe());
-    let atlas = atlas::Atlas::build(assets.as_ref());
-    println!("atlas: {}x{} pixels", atlas.width, atlas.height);
+    // The models say which textures exist, so the shapes are read before the atlas is packed.
+    let mut shapes = shapes::Shapes::new(assets.clone());
+    let wanted = shapes.every_texture();
+    let atlas = atlas::Atlas::build(assets.as_ref(), &wanted);
+    shapes.set_fallback(&atlas);
+    let missing = wanted.iter().filter(|name| !atlas.has(name)).count();
+    println!(
+        "atlas: {}x{} pixels, {} textures from the game's own models{}",
+        atlas.width,
+        atlas.height,
+        atlas.len(),
+        if missing == 0 {
+            String::new()
+        } else {
+            format!(" ({missing} of them missing from the pack)")
+        }
+    );
     let items = items::Items::build(assets.as_ref());
     println!("items: {} pictures", items.len());
     let sheet = assets.texture("font/ascii");
@@ -116,6 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chosen,
         straight_in,
         mods,
+        shapes,
         audio,
     );
     event_loop.run_app(&mut app)?;
@@ -192,6 +209,8 @@ struct App {
     straight_in: bool,
     /// Which box on a menu is being typed into.
     focus: Option<Field>,
+    /// Every block shape that has been baked out of the game's models.
+    shapes: shapes::Shapes,
     /// Scripted mods, and how much of the chat they have been shown.
     mods: ninefold_mods::Mods,
     chat_seen: usize,
@@ -281,6 +300,7 @@ impl App {
         settings: Settings,
         straight_in: bool,
         mods: ninefold_mods::Mods,
+        shapes: shapes::Shapes,
         audio: sound::Audio,
     ) -> Self {
         Self {
@@ -290,6 +310,7 @@ impl App {
             settings,
             straight_in,
             focus: None,
+            shapes,
             mods,
             chat_seen: 0,
             mod_hud: Vec::new(),
@@ -480,7 +501,8 @@ impl App {
         todo.sort_by_key(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2));
 
         for at in todo.into_iter().take(PER_FRAME) {
-            let (vertices, indices) = world::column(session, &self.art.atlas, at);
+            let (vertices, indices) =
+                world::column(session, &self.art.atlas, &mut self.shapes, at);
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_column(at, &vertices, &indices);
             }
@@ -836,6 +858,18 @@ impl App {
         });
         // What the hand is showing, which during a swap is not what is held.
         let held = self.shown;
+        // Whatever is in hand has to be baked before it can be held, because it may be a block
+        // nobody has seen in the world yet.
+        if let Some(block) = held.and_then(ninefold_protocol::item::Slot::as_block) {
+            self.shapes
+                .prepare(&self.art.atlas, block, ninefold_model::states::Links::default());
+        }
+        let shape = held
+            .and_then(ninefold_protocol::item::Slot::as_block)
+            .and_then(|block| {
+                self.shapes
+                    .get(block, ninefold_model::states::Links::default())
+            });
         // Nothing in front of the camera while a menu is up, or the hand floats over the menu.
         let (vertices, indices, sheet) = if self.screen.modal() || self.session.is_none() {
             (Vec::new(), Vec::new(), ninefold_render::Sheet::Blocks)
@@ -843,7 +877,7 @@ impl App {
             hand::held(
                 &basis,
                 &hand::Holding {
-                    atlas: &self.art.atlas,
+                    shape,
                     items: &self.art.items,
                     skin: self.art.mobs.placed.get("entity/steve").copied(),
                     held,
@@ -880,9 +914,10 @@ impl App {
     fn readout(&self) -> Vec<String> {
         let mut lines = vec![format!("ninefold {}", env!("CARGO_PKG_VERSION"))];
         lines.push(format!(
-            "{:.0} fps   {} chunks meshed   sound: {}",
+            "{:.0} fps   {} chunks   {} block shapes   sound: {}",
             self.fps,
             self.meshed.len(),
+            self.shapes.len(),
             self.audio.describe()
         ));
         if !self.mods.is_empty() {
@@ -942,9 +977,9 @@ impl App {
         let mut ui = gui::Ui::new(self.size.0, self.size.1);
         let mouse = ui.at(self.mouse.0, self.mouse.1);
         let art = gui::SlotArt {
-            atlas: &self.art.atlas,
             items: &self.art.items,
             font: &self.art.font,
+            shapes: &self.shapes,
             light: 1.0,
         };
 
@@ -990,9 +1025,12 @@ impl App {
             }
         };
 
-        // The readout first, then anything the mods want to say, under it.
+        // The readout first, then anything the mods want to say, under it. Neither is drawn over
+        // a menu: the title screen has its own writing in that corner.
         let mut lines = if self.debug { self.readout() } else { Vec::new() };
-        lines.extend(self.mod_hud.iter().cloned());
+        if self.session.is_some() {
+            lines.extend(self.mod_hud.iter().cloned());
+        }
         if !lines.is_empty() {
             screens::debug(&mut ui, &self.art.font, &lines);
         }
