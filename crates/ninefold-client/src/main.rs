@@ -625,18 +625,21 @@ impl App {
     }
 
     fn tick_physics(&mut self) {
-        let Some(session) = self.session.as_mut() else {
+        if self.session.is_none() {
             return;
-        };
+        }
         self.previous = [self.body.x, self.body.y, self.body.z];
-        if session.dead {
+        let dead = self.session.as_ref().is_some_and(|session| session.dead);
+        if dead {
             // Nothing to send and nothing to move: the server is waiting to be asked for a
             // respawn, and anything else it would ignore.
             return;
         }
         // A shove from the server — an explosion, a mob's hit — happened to us, not to our idea
         // of ourselves, so it goes straight onto the motion.
-        if let Some((vx, vy, vz)) = session.pushed.take() {
+        if let Some(session) = self.session.as_mut()
+            && let Some((vx, vy, vz)) = session.pushed.take()
+        {
             self.body.motion_x += vx;
             self.body.motion_y += vy;
             self.body.motion_z += vz;
@@ -660,7 +663,22 @@ impl App {
             yaw: self.yaw,
         };
         let was = (self.body.x, self.body.z);
-        self.body.tick(input, session);
+
+        // Walked into with the same shapes it is drawn with, which is what makes a slab a step
+        // and a fence a fence.
+        if let Some(session) = self.session.as_ref() {
+            let world = world::Collide {
+                session,
+                shapes: &self.shapes,
+            };
+            self.body.tick(input, &world);
+        }
+
+        let moved = ((self.body.x - was.0).powi(2) + (self.body.z - was.1).powi(2)).sqrt();
+        let on_ground = self.body.on_ground;
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
         let p = &mut session.position;
         p.x = self.body.x;
         p.y = self.body.y;
@@ -692,7 +710,7 @@ impl App {
         if self.equip > 0.9 {
             self.shown = current;
         }
-        let moved = ((self.body.x - was.0).powi(2) + (self.body.z - was.1).powi(2)).sqrt();
+
         let under = session
             .block_at(
                 self.body.x.floor() as i32,
@@ -700,7 +718,6 @@ impl App {
                 self.body.z.floor() as i32,
             )
             .unwrap_or(0);
-        let on_ground = self.body.on_ground;
         self.audio.walking(moved, under, !on_ground);
     }
 

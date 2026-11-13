@@ -90,6 +90,42 @@ pub fn links_of(session: &Session, at: (i32, i32, i32)) -> Links {
     }
 }
 
+/// The world as the physics walks into it.
+///
+/// The same shapes the renderer draws: a slab you stand on half way up, a snow layer you walk
+/// over, a fence you cannot jump. Anything whose shape has not been baked yet falls back to the
+/// old answer — a whole cube if it is solid — because the alternative is falling through a
+/// chunk the mesher has not reached.
+pub struct Collide<'a> {
+    pub session: &'a Session,
+    pub shapes: &'a Shapes,
+}
+
+impl ninefold_protocol::physics::World for Collide<'_> {
+    fn solid(&self, x: i32, y: i32, z: i32) -> bool {
+        self.session
+            .block_at(x, y, z)
+            .is_some_and(ninefold_protocol::blocks::solid)
+    }
+
+    fn boxes(&self, x: i32, y: i32, z: i32) -> &[([f32; 3], [f32; 3])] {
+        let block = self.session.block_at(x, y, z).unwrap_or(0);
+        match self.shapes.get(block, links_of(self.session, (x, y, z))) {
+            Some(baked) => &baked.collision,
+            None if ninefold_protocol::blocks::solid(block) => {
+                ninefold_protocol::physics::FULL_CUBE
+            }
+            None => &[],
+        }
+    }
+
+    fn fluid(&self, x: i32, y: i32, z: i32) -> ninefold_protocol::blocks::Fluid {
+        self.session
+            .block_at(x, y, z)
+            .map_or(ninefold_protocol::blocks::Fluid::None, ninefold_protocol::blocks::fluid)
+    }
+}
+
 /// Mesh one chunk column, with atlas coordinates and biome colours on every corner.
 ///
 /// One column at a time is the point: the server loads and unloads chunks constantly as you

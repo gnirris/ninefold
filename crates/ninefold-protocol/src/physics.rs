@@ -55,6 +55,10 @@ const FLUID_GRAVITY: f64 = 0.02;
 const SWIM_PUSH: f64 = 0.02;
 /// Holding jump in water swims upwards.
 const SWIM_UP: f64 = 0.04;
+/// How high a step the player walks up without jumping. Stairs and slabs are built around it,
+/// and without it a staircase has to be jumped up one block at a time.
+const STEP_HEIGHT: f64 = 0.6;
+
 /// The constant that makes ground acceleration come out at exactly the walk speed:
 /// `0.6 * 0.91` cubed.
 const GROUND_ACCEL: f64 = 0.163_277_136 - 0.000_505_8;
@@ -85,10 +89,23 @@ pub struct Body {
     pub on_ground: bool,
 }
 
+/// A block that fills its cube, for worlds that only know solid from not.
+pub const FULL_CUBE: &[([f32; 3], [f32; 3])] = &[([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])];
+
 /// Whatever the player might walk into.
 pub trait World {
     /// Is the block at these coordinates something you cannot walk through?
     fn solid(&self, x: i32, y: i32, z: i32) -> bool;
+
+    /// The boxes this block is actually made of, in block-local units.
+    ///
+    /// Almost nothing in Minecraft fills its cube, and the difference is felt rather than seen:
+    /// a slab you can step onto, a snow layer you walk over, a fence you cannot jump. The
+    /// default is the old answer — a whole cube or nothing — so a world that knows no better
+    /// still works.
+    fn boxes(&self, x: i32, y: i32, z: i32) -> &[([f32; 3], [f32; 3])] {
+        if self.solid(x, y, z) { FULL_CUBE } else { &[] }
+    }
 
     /// Is it a liquid, and which? Nothing, unless something knows better.
     fn fluid(&self, _x: i32, _y: i32, _z: i32) -> crate::blocks::Fluid {
@@ -303,16 +320,40 @@ impl Body {
             }
             return to;
         }
-        // Blocked: stop against the face of the block.
+        // Blocked: stop against the face of whatever was hit.
         if axis == 1 {
             if amount < 0.0 {
                 self.on_ground = true;
                 self.motion_y = 0.0;
-                return to.floor() + 1.0;
+                // The top of a slab is where you land on a slab. Snapping to the top of the
+                // whole block instead is what made standing on anything half-height impossible.
+                return self.surface_below(world, from).unwrap_or(to.floor() + 1.0);
             }
             self.motion_y = 0.0;
             return from;
         }
+
+        // Walking into something: try stepping over it before giving up, which is how anyone
+        // gets up a staircase without jumping.
+        if self.on_ground {
+            let mut raised = moved;
+            raised[1] = self.y + STEP_HEIGHT;
+            if self.clear(world, raised) {
+                let probe = Body {
+                    x: raised[0],
+                    z: raised[2],
+                    ..*self
+                };
+                if let Some(top) = probe.surface_below(world, raised[1]) {
+                    let settled = [raised[0], top, raised[2]];
+                    if top > self.y && self.clear(world, settled) {
+                        self.y = top;
+                        return to;
+                    }
+                }
+            }
+        }
+
         if axis == 0 {
             self.motion_x = 0.0;
         } else {
@@ -323,16 +364,32 @@ impl Body {
 
     /// Is the player's box free of solid blocks at this position?
     fn clear(&self, world: &impl World, at: [f64; 3]) -> bool {
+        const SLACK: f64 = 1e-7;
         let half = WIDTH / 2.0;
-        let (x0, x1) = ((at[0] - half).floor() as i32, (at[0] + half).floor() as i32);
-        let (z0, z1) = ((at[2] - half).floor() as i32, (at[2] + half).floor() as i32);
-        // The top of the box is exclusive: standing exactly under a ceiling is allowed.
-        let (y0, y1) = (at[1].floor() as i32, (at[1] + HEIGHT - 1e-7).floor() as i32);
+        let (px0, px1) = (at[0] - half, at[0] + half);
+        let (py0, py1) = (at[1], at[1] + HEIGHT);
+        let (pz0, pz1) = (at[2] - half, at[2] + half);
+        let (x0, x1) = (px0.floor() as i32, px1.floor() as i32);
+        // One row further down than the feet, because a fence is taller than its own block and
+        // would otherwise be walked straight through at the top.
+        let (y0, y1) = (py0.floor() as i32 - 1, (py1 - SLACK).floor() as i32);
+        let (z0, z1) = (pz0.floor() as i32, pz1.floor() as i32);
         for x in x0..=x1 {
             for y in y0..=y1 {
                 for z in z0..=z1 {
-                    if world.solid(x, y, z) {
-                        return false;
+                    for (from, to) in world.boxes(x, y, z) {
+                        let bx = (f64::from(x) + f64::from(from[0]), f64::from(x) + f64::from(to[0]));
+                        let by = (f64::from(y) + f64::from(from[1]), f64::from(y) + f64::from(to[1]));
+                        let bz = (f64::from(z) + f64::from(from[2]), f64::from(z) + f64::from(to[2]));
+                        if px0 < bx.1 - SLACK
+                            && px1 > bx.0 + SLACK
+                            && py0 < by.1 - SLACK
+                            && py1 > by.0 + SLACK
+                            && pz0 < bz.1 - SLACK
+                            && pz1 > bz.0 + SLACK
+                        {
+                            return false;
+                        }
                     }
                 }
             }
@@ -340,31 +397,42 @@ impl Body {
         true
     }
 
-    /// Is there a block directly under the player's feet?
-    fn standing_on(&self, world: &impl World, y: f64) -> bool {
+    /// The highest surface at or below the player's feet that they are standing over.
+    ///
+    /// This is what makes half-height blocks work: the answer for a slab is the top of the slab,
+    /// not the top of the block it is in.
+    fn surface_below(&self, world: &impl World, feet: f64) -> Option<f64> {
+        const SLACK: f64 = 1e-4;
         let half = WIDTH / 2.0;
-        let below = (y - 1e-7).floor() as i32 - if y.fract() == 0.0 { 1 } else { 0 };
-        let below = if y.fract() == 0.0 {
-            y as i32 - 1
-        } else {
-            below
-        };
-        let (x0, x1) = (
-            (self.x - half).floor() as i32,
-            (self.x + half).floor() as i32,
-        );
-        let (z0, z1) = (
-            (self.z - half).floor() as i32,
-            (self.z + half).floor() as i32,
-        );
-        for x in x0..=x1 {
-            for z in z0..=z1 {
-                if world.solid(x, below, z) {
-                    return true;
+        let (x0, x1) = ((self.x - half).floor() as i32, (self.x + half).floor() as i32);
+        let (z0, z1) = ((self.z - half).floor() as i32, (self.z + half).floor() as i32);
+        let mut best: Option<f64> = None;
+        for y in (feet.floor() as i32 - 1)..=(feet.ceil() as i32) {
+            for x in x0..=x1 {
+                for z in z0..=z1 {
+                    for (from, to) in world.boxes(x, y, z) {
+                        let top = f64::from(y) + f64::from(to[1]);
+                        let bx = (f64::from(x) + f64::from(from[0]), f64::from(x) + f64::from(to[0]));
+                        let bz = (f64::from(z) + f64::from(from[2]), f64::from(z) + f64::from(to[2]));
+                        let under = self.x - half < bx.1 - 1e-7
+                            && self.x + half > bx.0 + 1e-7
+                            && self.z - half < bz.1 - 1e-7
+                            && self.z + half > bz.0 + 1e-7;
+                        if under && top <= feet + SLACK && best.is_none_or(|b| top > b) {
+                            best = Some(top);
+                        }
+                    }
                 }
             }
         }
-        false
+        best
+    }
+
+    fn standing_on(&self, world: &impl World, y: f64) -> bool {
+        // On the ground means a surface within a hair of the feet, whatever its height: the top
+        // of a slab is as much ground as the top of a block.
+        self.surface_below(world, y)
+            .is_some_and(|top| (y - top).abs() < 1e-4)
     }
 
     /// Horizontal speed, in blocks per second.
@@ -377,6 +445,146 @@ impl Body {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A floor of whole blocks with something of a given height sitting on top of it at x >= 1.
+    ///
+    /// Enough to tell the three cases apart: walking onto a half-height block, walking into a
+    /// full one, and walking into something taller than it looks.
+    struct Ledge {
+        /// How tall the thing at x >= 1 is, in blocks.
+        height: f32,
+    }
+
+    impl World for Ledge {
+        fn solid(&self, _x: i32, y: i32, _z: i32) -> bool {
+            y < 0
+        }
+        fn boxes(&self, x: i32, y: i32, _z: i32) -> &[([f32; 3], [f32; 3])] {
+            if y < 0 {
+                return FULL_CUBE;
+            }
+            if y == 0 && x >= 1 {
+                // Leaked once per height, which is fine for a test and keeps the signature
+                // borrow-free.
+                return match self.height {
+                    h if h <= 0.125 => &[([0.0, 0.0, 0.0], [1.0, 0.125, 1.0])],
+                    h if h <= 0.5 => &[([0.0, 0.0, 0.0], [1.0, 0.5, 1.0])],
+                    h if h <= 1.0 => FULL_CUBE,
+                    _ => &[([0.0, 0.0, 0.0], [1.0, 1.5, 1.0])],
+                };
+            }
+            &[]
+        }
+    }
+
+    /// Walk east for a while and report where the feet ended up.
+    fn walk_east(world: &impl World, ticks: u32) -> Body {
+        let mut body = Body {
+            x: 0.5,
+            y: 0.0,
+            z: 0.5,
+            on_ground: true,
+            ..Body::default()
+        };
+        let input = Input {
+            forward: 1.0,
+            yaw: -90.0,
+            ..Input::default()
+        };
+        for _ in 0..ticks {
+            body.tick(input, world);
+        }
+        body
+    }
+
+    #[test]
+    fn you_stand_on_top_of_a_slab_and_not_on_top_of_its_block() {
+        let world = Ledge { height: 0.5 };
+        let mut body = Body {
+            x: 1.5,
+            y: 2.0,
+            z: 0.5,
+            ..Body::default()
+        };
+        for _ in 0..40 {
+            body.tick(Input::default(), &world);
+        }
+        assert!(
+            (body.y - 0.5).abs() < 1e-3,
+            "landed at {} rather than on the slab at 0.5",
+            body.y
+        );
+        assert!(body.on_ground);
+    }
+
+    #[test]
+    fn a_snow_layer_is_an_eighth_of_a_block_to_stand_on() {
+        let world = Ledge { height: 0.125 };
+        let mut body = Body {
+            x: 1.5,
+            y: 2.0,
+            z: 0.5,
+            ..Body::default()
+        };
+        for _ in 0..40 {
+            body.tick(Input::default(), &world);
+        }
+        assert!((body.y - 0.125).abs() < 1e-3, "landed at {}", body.y);
+    }
+
+    #[test]
+    fn walking_into_a_slab_steps_up_onto_it() {
+        let world = Ledge { height: 0.5 };
+        let body = walk_east(&world, 25);
+        assert!(body.x > 1.5, "did not get past the slab: x={}", body.x);
+        assert!(
+            (body.y - 0.5).abs() < 1e-3,
+            "should be standing on it at 0.5, not {}",
+            body.y
+        );
+    }
+
+    #[test]
+    fn walking_into_a_whole_block_does_not_climb_it() {
+        // Six tenths of a block is the limit, and a block is more than that.
+        let world = Ledge { height: 1.0 };
+        let body = walk_east(&world, 25);
+        assert!(body.y < 0.01, "climbed to {} unaided", body.y);
+        assert!(body.x < 1.0, "walked through it to x={}", body.x);
+    }
+
+    #[test]
+    fn a_fence_is_taller_than_its_block_and_stops_you() {
+        let world = Ledge { height: 1.5 };
+        let body = walk_east(&world, 25);
+        assert!(body.x < 1.0, "walked into the fence to x={}", body.x);
+        // And jumping does not clear it either.
+        let mut jumper = Body {
+            x: 0.7,
+            y: 0.0,
+            z: 0.5,
+            on_ground: true,
+            ..Body::default()
+        };
+        let input = Input {
+            forward: 1.0,
+            jump: true,
+            yaw: -90.0,
+            ..Input::default()
+        };
+        for _ in 0..30 {
+            jumper.tick(input, &world);
+        }
+        assert!(jumper.x < 1.0, "jumped the fence to x={}", jumper.x);
+    }
+
+    #[test]
+    fn a_world_that_only_knows_solid_from_not_still_works() {
+        // The default `boxes` is the old answer, so nothing that came before this notices.
+        let floor = Floor { ground: 0 };
+        assert_eq!(floor.boxes(0, -1, 0), FULL_CUBE);
+        assert!(floor.boxes(0, 5, 0).is_empty());
+    }
 
     fn standing() -> Body {
         Body {
