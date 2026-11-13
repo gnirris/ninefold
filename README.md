@@ -320,6 +320,30 @@ times a second.
 Two examples ship in [`packaging/mods`](packaging/mods) and are copied into place on first
 install.
 
+## Combat
+
+1.8 has no attack cooldown. That is not an oversight to be fixed later — it is the entire reason
+this version still has players, and it is what a 1.9+ client with a translation proxy cannot give
+them. A swing lands whenever it is sent.
+
+Reach is two numbers, not one, and they are vanilla's: four and a half blocks to mine, three to
+hit something alive, six in creative. Using the block reach for both is the oldest cheat in the
+game, so they are kept apart. Entity boxes are grown by a tenth of a block on every side, as the
+game does, which is what makes hitting someone at the edge of your aim feel fair rather than
+exact; and an entity standing against a wall is hit instead of the wall, because both are
+measured along the same ray.
+
+## Containers
+
+Chests, furnaces, workbenches and dispensers, laid out at the coordinates 1.8 puts their slots
+and drawn from the game's own art. A container's window is its own slots followed by the
+player's, which is how the server numbers them and so how a click has to name them — the two are
+kept in step, or closing a chest leaves a stale hotbar behind.
+
+Chests themselves have no model: the game draws them, and a few others — signs, beds, banners,
+skulls — with renderers written in code rather than as JSON. Those come out as a cube of the
+right material, which is wrong and is the right size and colour.
+
 ## Scoreboards
 
 The sidebar servers use for ranks, coins and map names: objectives, scores and teams, drawn

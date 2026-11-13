@@ -48,6 +48,37 @@ impl Hit {
 /// How far a 1.8 player can reach.
 pub const REACH: f64 = 4.5;
 
+/// How far along a ray a box is first touched, if it is touched at all.
+///
+/// The standard slab test: clip the ray against each pair of parallel faces in turn and keep
+/// the overlap. Used for two things that look unrelated and are the same question — how far away
+/// an entity is along the line of sight, and how far away the block behind it is, so that
+/// hitting a pig standing against a wall hits the pig.
+#[must_use]
+pub fn ray_box(from: [f64; 3], direction: [f64; 3], min: [f64; 3], max: [f64; 3]) -> Option<f64> {
+    let mut near: f64 = 0.0;
+    let mut far = f64::INFINITY;
+    for axis in 0..3 {
+        let d = direction[axis];
+        if d.abs() < 1e-9 {
+            // Parallel to this pair of faces: either inside them for the whole ray, or never.
+            if from[axis] < min[axis] || from[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let t0 = (min[axis] - from[axis]) / d;
+        let t1 = (max[axis] - from[axis]) / d;
+        let (t0, t1) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+        near = near.max(t0);
+        far = far.min(t1);
+        if near > far {
+            return None;
+        }
+    }
+    (far >= 0.0).then_some(near)
+}
+
 /// The first solid block along the ray, within `distance`.
 #[must_use]
 pub fn cast(world: &impl World, from: [f64; 3], direction: [f64; 3], distance: f64) -> Option<Hit> {
@@ -149,6 +180,45 @@ const fn sign(v: f64) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use super::ray_box;
+
+    #[test]
+    fn a_box_straight_ahead_is_found_at_its_near_face() {
+        let hit = ray_box(
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, -0.5, -0.5],
+            [3.0, 0.5, 0.5],
+        );
+        assert_eq!(hit, Some(2.0));
+    }
+
+    #[test]
+    fn a_box_behind_or_beside_is_not_found() {
+        // Behind.
+        assert_eq!(
+            ray_box([0.0; 3], [1.0, 0.0, 0.0], [-3.0, -0.5, -0.5], [-2.0, 0.5, 0.5]),
+            None
+        );
+        // Beside, with the ray parallel to the faces it would have to pass through.
+        assert_eq!(
+            ray_box([0.0; 3], [1.0, 0.0, 0.0], [2.0, 5.0, -0.5], [3.0, 6.0, 0.5]),
+            None
+        );
+    }
+
+    #[test]
+    fn standing_inside_a_box_counts_as_touching_it_now() {
+        assert_eq!(ray_box([0.0; 3], [1.0, 0.0, 0.0], [-1.0; 3], [1.0; 3]), Some(0.0));
+    }
+
+    #[test]
+    fn the_nearer_of_two_boxes_is_the_one_that_is_hit() {
+        let near = ray_box([0.0; 3], [0.0, 0.0, 1.0], [-1.0, -1.0, 2.0], [1.0, 1.0, 3.0]);
+        let far = ray_box([0.0; 3], [0.0, 0.0, 1.0], [-1.0, -1.0, 6.0], [1.0, 1.0, 7.0]);
+        assert!(near < far, "{near:?} should be nearer than {far:?}");
+    }
+
     use super::*;
     use crate::physics::Floor;
 

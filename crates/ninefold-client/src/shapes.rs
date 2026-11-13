@@ -74,6 +74,10 @@ impl Shapes {
             "blocks/water_flow",
             "blocks/lava_still",
             "blocks/lava_flow",
+            // The blocks the game draws for itself still need something to be a cube of.
+            "blocks/planks_oak",
+            "blocks/obsidian",
+            "blocks/soul_sand",
         ] {
             if seen.insert(extra.to_owned()) {
                 names.push(extra.to_owned());
@@ -128,7 +132,13 @@ impl Shapes {
             return liquid(atlas, "blocks/lava_still", 0);
         }
         let Some((state, key)) = states::state_of(block, links) else {
-            return Baked::default();
+            // A handful of blocks have no model because the game draws them with a renderer of
+            // their own — chests, signs, beds, banners. A cube of the right material is wrong,
+            // but it is the right size and the right colour, which is nearer than nothing.
+            return match tile_entity(block) {
+                Some(texture) => cube(atlas, texture, 0),
+                None => Baked::default(),
+            };
         };
         let Some((model, turn)) = self.models.variant(&state, &key) else {
             return Baked::default();
@@ -183,6 +193,21 @@ impl Shapes {
             collision,
             ambient_occlusion: shape.ambient_occlusion,
         }
+    }
+}
+
+/// What a block the game draws for itself is roughly made of.
+///
+/// These are the blocks with no model file at all: a chest is a model in code, not in JSON. The
+/// texture here is the one vanilla uses for their breaking particles, which is as close as a
+/// cube can get.
+fn tile_entity(block: u16) -> Option<&'static str> {
+    match block >> 4 {
+        26 | 54 | 63 | 68 | 146 | 176 | 177 => Some("blocks/planks_oak"),
+        130 => Some("blocks/obsidian"),
+        138 => Some("blocks/obsidian"),
+        144 => Some("blocks/soul_sand"),
+        _ => None,
     }
 }
 

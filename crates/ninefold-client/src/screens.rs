@@ -24,6 +24,8 @@ pub enum Screen {
     Connecting,
     Pause,
     Inventory,
+    /// A chest, a furnace, a workbench — whatever the server opened.
+    Container,
     /// Typing, with the chat box open.
     Chat,
     /// The connection failed or was lost.
@@ -433,6 +435,154 @@ pub fn slot_at(index: usize) -> Option<(f32, f32)> {
     }
 }
 
+/// Where a container's slots sit, and which art it is drawn on.
+pub struct Panel {
+    pub art: (u32, u32),
+    pub width: f32,
+    pub height: f32,
+    /// Every slot in window order: the container's own first, then the player's inventory, then
+    /// the hotbar — which is how the server numbers them and so how a click names them.
+    pub slots: Vec<(f32, f32)>,
+}
+
+/// Lay out a container of a given kind, at the coordinates 1.8 puts its slots.
+#[must_use]
+pub fn panel_for(kind: &str, own: usize) -> Panel {
+    let row = |y: f32, n: usize, x: f32| -> Vec<(f32, f32)> {
+        (0..n).map(|c| (x + c as f32 * 18.0, y)).collect()
+    };
+    // The player's own three rows and hotbar, which every container has underneath it.
+    let player = |top: f32| -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for r in 0..3 {
+            out.extend(row(top + r as f32 * 18.0, 9, 8.0));
+        }
+        out.extend(row(top + 58.0, 9, 8.0));
+        out
+    };
+
+    match kind {
+        "minecraft:crafting_table" => {
+            let mut slots = vec![(124.0, 35.0)];
+            for r in 0..3 {
+                slots.extend(row(17.0 + r as f32 * 18.0, 3, 30.0));
+            }
+            slots.extend(player(84.0));
+            Panel {
+                art: gui::CRAFTING,
+                width: 176.0,
+                height: 166.0,
+                slots,
+            }
+        }
+        "minecraft:furnace" => {
+            let mut slots = vec![(56.0, 17.0), (56.0, 53.0), (116.0, 35.0)];
+            slots.extend(player(84.0));
+            Panel {
+                art: gui::FURNACE,
+                width: 176.0,
+                height: 166.0,
+                slots,
+            }
+        }
+        "minecraft:dispenser" | "minecraft:dropper" => {
+            let mut slots = Vec::new();
+            for r in 0..3 {
+                slots.extend(row(17.0 + r as f32 * 18.0, 3, 62.0));
+            }
+            slots.extend(player(84.0));
+            Panel {
+                art: gui::DISPENSER,
+                width: 176.0,
+                height: 166.0,
+                slots,
+            }
+        }
+        // Anything else is drawn as a chest of however many rows it needs, which is right for
+        // chests and ender chests and no worse than nothing for the rest.
+        _ => {
+            let rows = own.div_ceil(9).clamp(1, 6);
+            let mut slots = Vec::new();
+            for r in 0..rows {
+                slots.extend(row(18.0 + r as f32 * 18.0, 9, 8.0));
+            }
+            // The art draws whole rows; the window has exactly as many slots as the server
+            // said. Emitting the difference would put clickable holes on the screen that name
+            // slots the server does not have.
+            slots.truncate(own);
+            // Vanilla shifts the player's own slots down by however many rows there are.
+            let shift = (rows as f32 - 4.0) * 18.0;
+            slots.extend(player(103.0 + shift));
+            Panel {
+                art: gui::CHEST,
+                width: 176.0,
+                height: 114.0 + rows as f32 * 18.0,
+                slots,
+            }
+        }
+    }
+}
+
+/// A container the server has opened.
+pub fn container(
+    ui: &mut Ui,
+    art: SlotArt<'_>,
+    window: (&str, &str, &[Option<Slot>], usize),
+    carried: Option<Slot>,
+    mouse: (f32, f32),
+) -> Vec<Hit> {
+    let (kind, title, slots, own) = window;
+    let panel = panel_for(kind, own);
+    let (w, h) = ui.size();
+    ui.rect(0.0, 0.0, w, h, [0.0, 0.0, 0.0, 0.4]);
+    let (ox, oy) = ((w - panel.width) / 2.0, (h - panel.height) / 2.0);
+
+    // A chest's art is two pieces: as many rows as it has, then the player's inventory from
+    // further down the same picture.
+    if panel.art == gui::CHEST {
+        let rows = own.div_ceil(9).clamp(1, 6) as f32;
+        let top = rows * 18.0 + 17.0;
+        ui.sprite(
+            gui::Sprite::panel(panel.art, 0, 0, panel.width as u32, top as u32),
+            ox,
+            oy,
+        );
+        ui.sprite(
+            gui::Sprite::panel(panel.art, 0, 126, panel.width as u32, 96),
+            ox,
+            oy + top,
+        );
+    } else {
+        ui.sprite(
+            gui::Sprite::panel(panel.art, 0, 0, panel.width as u32, panel.height as u32),
+            ox,
+            oy,
+        );
+    }
+    ui.text_flat(art.font, title, ox + 8.0, oy + 6.0, [0.25, 0.25, 0.25, 1.0]);
+
+    let mut hits = Vec::new();
+    for (index, (sx, sy)) in panel.slots.iter().enumerate() {
+        let (x, y) = (ox + sx, oy + sy);
+        let hit = Hit {
+            action: Action::Slot(index),
+            at: (x, y),
+            size: (16.0, 16.0),
+        };
+        if hit.covers(mouse.0, mouse.1) {
+            ui.rect(x, y, 16.0, 16.0, [1.0, 1.0, 1.0, 0.4]);
+        }
+        if let Some(stack) = slots.get(index).copied().flatten() {
+            ui.slot(art, stack, x, y);
+        }
+        hits.push(hit);
+    }
+    if let Some(stack) = carried {
+        ui.slot(art, stack, mouse.0 - 8.0, mouse.1 - 8.0);
+    }
+    hits
+}
+
 /// The chat log, and the box being typed into.
 pub fn chat(ui: &mut Ui, font: &Font, lines: &[String], typing: Option<&str>) {
     let (w, h) = ui.size();
@@ -768,6 +918,54 @@ mod tests {
             ui.text.len()
         };
         assert!(count(Some(Field::Server)) > count(None));
+    }
+
+    #[test]
+    fn a_chest_has_a_row_of_slots_for_every_nine_it_holds() {
+        let small = panel_for("minecraft:chest", 27);
+        assert_eq!(small.slots.len(), 27 + 36, "its own, then the player's");
+        let large = panel_for("minecraft:chest", 54);
+        assert_eq!(large.slots.len(), 54 + 36);
+        assert!(large.height > small.height, "a double chest is taller");
+        // The first slot is where vanilla puts it.
+        assert_eq!(small.slots[0], (8.0, 18.0));
+    }
+
+    #[test]
+    fn the_named_containers_have_their_own_layouts() {
+        let bench = panel_for("minecraft:crafting_table", 10);
+        assert_eq!(bench.slots.len(), 10 + 36);
+        assert_eq!(bench.slots[0], (124.0, 35.0), "the result slot");
+        let furnace = panel_for("minecraft:furnace", 3);
+        assert_eq!(furnace.slots.len(), 3 + 36);
+        assert_eq!(furnace.slots[1], (56.0, 53.0), "the fuel slot");
+        assert_ne!(bench.art, furnace.art, "and their own art");
+    }
+
+    #[test]
+    fn something_unknown_is_drawn_as_a_chest_rather_than_not_at_all() {
+        let odd = panel_for("minecraft:beacon", 1);
+        assert_eq!(odd.art, gui::CHEST);
+        assert_eq!(odd.slots.len(), 1 + 36);
+    }
+
+    #[test]
+    fn no_two_slots_of_a_container_sit_on_top_of_each_other() {
+        for kind in [
+            "minecraft:chest",
+            "minecraft:crafting_table",
+            "minecraft:furnace",
+            "minecraft:dispenser",
+        ] {
+            let panel = panel_for(kind, 27);
+            let mut seen = std::collections::HashSet::new();
+            for (x, y) in &panel.slots {
+                assert!(
+                    seen.insert((*x as i32, *y as i32)),
+                    "{kind} has two slots at {x},{y}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -251,6 +251,8 @@ struct App {
     typed: String,
     /// The block under the crosshair, if any.
     aimed: Option<raycast::Hit>,
+    /// The entity under the crosshair, if one is nearer than that block.
+    target: Option<i32>,
     /// Frames drawn since `counted_from`, for the readout.
     frames: u32,
     counted_from: Instant,
@@ -334,6 +336,7 @@ impl App {
             hits: Vec::new(),
             typed: String::new(),
             aimed: None,
+            target: None,
             frames: 0,
             counted_from: Instant::now(),
             fps: 0.0,
@@ -792,9 +795,16 @@ impl App {
                     boxes.push((at, [w, h, w], [0.6, 0.85, 1.0, 0.8]));
                 }
             }
-            if self.hitboxes {
+            // The one under the crosshair is outlined whether or not hitboxes are on, so it is
+            // obvious what a click would hit.
+            if self.hitboxes || self.target == Some(*id) {
                 let (w, h) = entity.kind.size();
-                boxes.push((at, [w, h, w], [1.0, 1.0, 1.0, 0.9]));
+                let colour = if self.target == Some(*id) {
+                    [1.0, 0.35, 0.35, 0.95]
+                } else {
+                    [1.0, 1.0, 1.0, 0.9]
+                };
+                boxes.push((at, [w, h, w], colour));
             }
         }
         if let Some(renderer) = &mut self.renderer {
@@ -855,6 +865,79 @@ impl App {
                 eprintln!("a mod could not say that: {e}");
             }
         }
+    }
+
+    /// How far a player can reach: blocks, and the shorter reach for hitting something alive.
+    ///
+    /// Vanilla's own numbers, and they are not the same — in survival you can mine a block at
+    /// four and a half blocks and only hit a player at three. Using the block reach for both is
+    /// the oldest cheat in the game.
+    fn reach(&self) -> (f64, f64) {
+        let creative = self.session.as_ref().is_some_and(Session::creative);
+        if creative {
+            (5.0, 6.0)
+        } else {
+            (raycast::REACH, 3.0)
+        }
+    }
+
+    /// Which entity is under the crosshair, and how far away it is.
+    ///
+    /// Boxes are grown by a tenth of a block on every side, as the game does, which is what
+    /// makes hitting someone at the edge of your aim feel fair rather than exact.
+    fn aimed_entity(&self, eye: [f64; 3], direction: [f64; 3], reach: f64) -> Option<(i32, f64)> {
+        const GROWN: f64 = 0.1;
+        let session = self.session.as_ref()?;
+        let mut best: Option<(i32, f64)> = None;
+        for (id, entity) in &session.entities {
+            // Our own body is not a target, and neither is a dropped item.
+            if *id == session.entity_id || matches!(entity.kind, play::Kind::Object(_)) {
+                continue;
+            }
+            let (width, height) = entity.kind.size();
+            let half = f64::from(width) / 2.0 + GROWN;
+            let drawn = self.smoothed.get(id).copied().unwrap_or([entity.x, entity.y, entity.z]);
+            let min = [drawn[0] - half, drawn[1] - GROWN, drawn[2] - half];
+            let max = [
+                drawn[0] + half,
+                drawn[1] + f64::from(height) + GROWN,
+                drawn[2] + half,
+            ];
+            if let Some(distance) = raycast::ray_box(eye, direction, min, max)
+                && distance <= reach
+                && best.is_none_or(|(_, nearest)| distance < nearest)
+            {
+                best = Some((*id, distance));
+            }
+        }
+        best
+    }
+
+    /// Hit whatever is under the crosshair, if it is alive.
+    ///
+    /// Returns whether anything was hit, because if something was then this was a punch and not
+    /// the start of digging.
+    fn swing_at_target(&mut self) -> bool {
+        let Some(target) = self.target else {
+            return false;
+        };
+        self.swing = SWING_TICKS;
+        let at = self
+            .session
+            .as_ref()
+            .and_then(|session| session.entities.get(&target))
+            .map(|entity| [entity.x, entity.y, entity.z]);
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.attack(target);
+            let _ = session.swing();
+        }
+        // The server answers with the entity's own hurt sound; this is the swing landing.
+        if let Some(at) = at {
+            let ear = [self.body.x, self.body.y + EYE_HEIGHT, self.body.z];
+            self.audio
+                .at("random.successful_hit", (&at, 0.5, 1.0), (&ear, self.yaw as f32));
+        }
+        true
     }
 
     /// The hand in front of the camera, and the cracks on whatever is being broken.
@@ -964,6 +1047,18 @@ impl App {
             session.day_time,
             session.sky_brightness()
         ));
+        if let Some(target) = self.target
+            && let Some(entity) = session.entities.get(&target)
+        {
+            lines.push(format!(
+                "aiming at {:?}{}",
+                entity.kind,
+                entity
+                    .name
+                    .as_ref()
+                    .map_or(String::new(), |name| format!(" ({name})"))
+            ));
+        }
         lines.push(match self.aimed {
             Some(hit) => {
                 let block = session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
@@ -989,8 +1084,41 @@ impl App {
         lines
     }
 
+    /// Bake the shapes of everything that is about to be drawn in a slot.
+    ///
+    /// A block in the hotbar may be one nobody has seen in the world, so its model has never
+    /// been read — and an unbaked shape draws as nothing at all.
+    fn prepare_slots(&mut self) {
+        let mut wanted: Vec<u16> = Vec::new();
+        if let Some(session) = &self.session {
+            let slots = session.inventory.iter().chain(
+                session
+                    .open
+                    .as_ref()
+                    .map_or([].iter(), |open| open.slots.iter()),
+            );
+            for stack in slots.flatten() {
+                if let Some(block) = stack.as_block()
+                    && !wanted.contains(&block)
+                {
+                    wanted.push(block);
+                }
+            }
+            if let Some(block) = session.carried.and_then(|s| s.as_block())
+                && !wanted.contains(&block)
+            {
+                wanted.push(block);
+            }
+        }
+        for block in wanted {
+            self.shapes
+                .prepare(&self.art.atlas, block, ninefold_model::states::Links::default());
+        }
+    }
+
     /// Draw whatever screen is in front, and remember what can be clicked.
     fn build_interface(&mut self) {
+        self.prepare_slots();
         let mut ui = gui::Ui::new(self.size.0, self.size.1);
         let mouse = ui.at(self.mouse.0, self.mouse.1);
         let art = gui::SlotArt {
@@ -1030,6 +1158,25 @@ impl App {
                     None => (Vec::new(), None),
                 };
                 screens::inventory(&mut ui, art, (&slots, carried), mouse)
+            }
+            Screen::Container => {
+                self.hud(&mut ui, art);
+                let open = self.session.as_ref().and_then(|session| {
+                    session
+                        .open
+                        .as_ref()
+                        .map(|open| (open.clone(), session.carried))
+                });
+                match open {
+                    Some((open, carried)) => screens::container(
+                        &mut ui,
+                        art,
+                        (&open.kind, &open.title, &open.slots, open.own),
+                        carried,
+                        mouse,
+                    ),
+                    None => Vec::new(),
+                }
             }
             Screen::None | Screen::Chat => {
                 self.hud(&mut ui, art);
@@ -1156,23 +1303,32 @@ impl App {
             eprintln!("could not click a slot: {e}");
             return;
         }
-        let under = session.inventory.get(index).copied().flatten();
+        // Whichever window is in front is the one being clicked.
+        let where_it_lives: &mut Vec<Option<ninefold_protocol::item::Slot>> =
+            match session.open.as_mut() {
+                Some(open) => &mut open.slots,
+                None => &mut session.inventory,
+            };
+        let Some(under) = where_it_lives.get_mut(index) else {
+            return;
+        };
+        let there = *under;
         let carried = session.carried;
-        match (under, carried) {
+        match (there, carried) {
             // Picking up.
             (Some(stack), None) => {
+                *under = None;
                 session.carried = Some(stack);
-                session.inventory[index] = None;
             }
             // Putting down into an empty slot.
             (None, Some(stack)) => {
-                session.inventory[index] = Some(stack);
+                *under = Some(stack);
                 session.carried = None;
             }
             // Swapping, or stacking — which the server will correct if it disagrees.
-            (Some(there), Some(holding)) => {
-                session.inventory[index] = Some(holding);
-                session.carried = Some(there);
+            (Some(_), Some(holding)) => {
+                *under = Some(holding);
+                session.carried = there;
             }
             (None, None) => {}
         }
@@ -1500,6 +1656,10 @@ impl ApplicationHandler for App {
                 } else {
                     match button {
                         MouseButton::Left => {
+                            // Something alive under the crosshair is a punch, not a dig.
+                            if pressed && self.swing_at_target() {
+                                return;
+                            }
                             self.swinging = pressed;
                             if pressed {
                                 self.swing = SWING_TICKS;
@@ -1513,7 +1673,19 @@ impl ApplicationHandler for App {
                                 eprintln!("could not stop digging: {e}");
                             }
                         }
-                        MouseButton::Right if pressed => self.place(),
+                        MouseButton::Right if pressed => {
+                            // Right clicking something alive is using it — mounting, trading,
+                            // shearing — and never placing a block inside it.
+                            match self.target {
+                                Some(target) => {
+                                    self.swing = SWING_TICKS;
+                                    if let Some(session) = self.session.as_mut() {
+                                        let _ = session.interact(target);
+                                    }
+                                }
+                                None => self.place(),
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1530,7 +1702,7 @@ impl ApplicationHandler for App {
                     }
                     Screen::Chat => {}
                     Screen::None => self.play_key(code, down),
-                    Screen::Inventory if down => {
+                    Screen::Inventory | Screen::Container if down => {
                         if matches!(code, KeyCode::Escape | KeyCode::KeyE) {
                             self.screen = Screen::None;
                             self.grab(true);
@@ -1635,6 +1807,16 @@ impl App {
                 }
             }
         }
+        // The server can open a container at any moment — a chest, a furnace, a villager's
+        // trades — and the screen follows it rather than the other way round.
+        let opened = self.session.as_ref().is_some_and(|s| s.open.is_some());
+        if opened && self.screen == Screen::None {
+            self.screen = Screen::Container;
+            self.grab(false);
+        } else if !opened && self.screen == Screen::Container {
+            self.screen = Screen::None;
+            self.grab(true);
+        }
         self.mesh_some();
 
         // Physics on its own clock, so movement does not depend on frame rate.
@@ -1660,18 +1842,38 @@ impl App {
                 f64::from(facing[1]),
                 f64::from(facing[2]),
             ];
+            let (block_reach, entity_reach) = self.reach();
             let aimed = self
                 .session
                 .as_ref()
-                .and_then(|session| raycast::cast(session, eye, direction, raycast::REACH));
+                .and_then(|session| raycast::cast(session, eye, direction, block_reach));
+            // How far away the block is, so an entity standing in front of a wall is hit
+            // instead of the wall.
+            let block_distance = aimed.and_then(|hit| {
+                raycast::ray_box(
+                    eye,
+                    direction,
+                    [f64::from(hit.x), f64::from(hit.y), f64::from(hit.z)],
+                    [
+                        f64::from(hit.x) + 1.0,
+                        f64::from(hit.y) + 1.0,
+                        f64::from(hit.z) + 1.0,
+                    ],
+                )
+            });
+            self.target = self
+                .aimed_entity(eye, direction, entity_reach)
+                .filter(|(_, distance)| block_distance.is_none_or(|block| *distance < block))
+                .map(|(id, _)| id);
             if aimed != self.aimed {
                 self.aimed = aimed;
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_highlight(aimed.map(|h| (h.x, h.y, h.z)));
                 }
             }
-        } else if self.aimed.is_some() {
+        } else if self.aimed.is_some() || self.target.is_some() {
             self.aimed = None;
+            self.target = None;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_highlight(None);
             }

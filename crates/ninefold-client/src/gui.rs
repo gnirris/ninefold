@@ -31,8 +31,12 @@ const ICONS_AT: (u32, u32) = (256, 0);
 const CONTAINER_AT: (u32, u32) = (0, 256);
 const MISC_AT: (u32, u32) = (256, 256);
 const TITLE_AT: (u32, u32) = (0, 512);
+const CHEST_AT: (u32, u32) = (256, 512);
+const CRAFTING_AT: (u32, u32) = (0, 768);
+const FURNACE_AT: (u32, u32) = (256, 768);
+const DISPENSER_AT: (u32, u32) = (0, 1024);
 const SHEET_WIDTH: u32 = 512;
-const SHEET_HEIGHT: u32 = 768;
+const SHEET_HEIGHT: u32 = 1280;
 
 /// A rectangle of one of the sheets, in its own pixels.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +86,12 @@ impl Sprite {
         }
     }
 
+    /// A piece of one of the container sheets, which are all 256 square.
+    #[must_use]
+    pub const fn panel(at: (u32, u32), x: u32, y: u32, w: u32, h: u32) -> Self {
+        Self { at, x, y, w, h }
+    }
+
     /// Take a piece out of this sprite, for the button halves.
     const fn part(self, dx: u32, w: u32) -> Self {
         Self {
@@ -110,6 +120,11 @@ pub const BUBBLE_POP: Sprite = Sprite::icons(25, 18, 9, 9);
 pub const XP_EMPTY: Sprite = Sprite::icons(0, 64, 182, 5);
 pub const XP_FULL: Sprite = Sprite::icons(0, 69, 182, 5);
 pub const INVENTORY: Sprite = Sprite::container(0, 0, 176, 166);
+/// Where each container's art sits in the sheet, for [`Sprite::panel`].
+pub const CHEST: (u32, u32) = CHEST_AT;
+pub const CRAFTING: (u32, u32) = CRAFTING_AT;
+pub const FURNACE: (u32, u32) = FURNACE_AT;
+pub const DISPENSER: (u32, u32) = DISPENSER_AT;
 /// The tiled dirt behind every menu.
 pub const DIRT: Sprite = Sprite::misc(0, 0, 16, 16);
 /// A patch of pure white, for drawing flat colour. Inset so no neighbour bleeds into it.
@@ -141,6 +156,10 @@ pub fn sheets(assets: &dyn AssetSource) -> Sheets {
         ("gui/container/inventory", CONTAINER_AT),
         ("gui/options_background", MISC_AT),
         ("gui/title/minecraft", TITLE_AT),
+        ("gui/container/generic_54", CHEST_AT),
+        ("gui/container/crafting_table", CRAFTING_AT),
+        ("gui/container/furnace", FURNACE_AT),
+        ("gui/container/dispenser", DISPENSER_AT),
     ] {
         if let Some(sheet) = assets.texture(name) {
             paste(&mut rgba, width, ox, oy, &sheet);

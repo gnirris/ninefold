@@ -59,6 +59,7 @@ const DISCONNECT: i32 = 0x40;
 // Serverbound.
 const OUT_KEEP_ALIVE: i32 = 0x00;
 const OUT_CHAT: i32 = 0x01;
+const OUT_USE_ENTITY: i32 = 0x02;
 const OUT_POSITION_AND_LOOK: i32 = 0x06;
 const OUT_DIG: i32 = 0x07;
 const OUT_PLACE: i32 = 0x08;
@@ -191,6 +192,21 @@ impl Scoreboard {
     }
 }
 
+/// A container the server has opened: a chest, a furnace, a workbench.
+///
+/// Its slots are its own followed by the player's inventory, in that order, because that is how
+/// the server numbers them and how a click has to name them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    pub id: u8,
+    /// What kind it is, as `minecraft:chest` or `minecraft:furnace`.
+    pub kind: String,
+    pub title: String,
+    pub slots: Vec<Option<Slot>>,
+    /// How many of those slots belong to the container rather than to the player.
+    pub own: usize,
+}
+
 /// Something the server asked to be heard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sound {
@@ -292,8 +308,8 @@ pub struct Session {
     names: HashMap<[u8; 16], String>,
     /// Whatever the server is keeping score of.
     pub scoreboard: Scoreboard,
-    /// The window the server has opened over the inventory, if any.
-    pub window: u8,
+    /// The container the server has opened over the inventory, if any.
+    pub open: Option<Window>,
     /// Rolling counter for window clicks, which the server echoes back.
     actions: i16,
 }
@@ -332,7 +348,7 @@ impl Session {
             hurt: false,
             names: HashMap::new(),
             scoreboard: Scoreboard::default(),
-            window: 0,
+            open: None,
             actions: 0,
         }
     }
@@ -744,29 +760,40 @@ impl Session {
                 let window = r.i8().map_err(bad)?;
                 let slot = r.i16().map_err(bad)?;
                 let stack = item::read(&mut r).map_err(bad)?;
-                if window == 0
-                    && let Ok(index) = usize::try_from(slot)
-                    && index < self.inventory.len()
-                {
-                    self.inventory[index] = stack;
+                // Window -1, slot -1 is what the mouse is carrying, not a slot at all.
+                if window == -1 && slot == -1 {
+                    self.carried = stack;
+                } else if let Ok(index) = usize::try_from(slot) {
+                    self.put(window, index, stack);
                 }
             }
             WINDOW_ITEMS => {
                 let mut r = Reader::new(&payload);
-                let window = r.u8().map_err(bad)?;
+                let window = i8::try_from(r.u8().map_err(bad)?).unwrap_or(0);
                 let count = r.i16().map_err(bad)?.max(0);
                 for index in 0..count as usize {
                     let stack = item::read(&mut r).map_err(bad)?;
-                    if window == 0 && index < self.inventory.len() {
-                        self.inventory[index] = stack;
-                    }
+                    self.put(window, index, stack);
                 }
             }
             OPEN_WINDOW => {
-                self.window = Reader::new(&payload).u8().map_err(bad)?;
+                let mut r = Reader::new(&payload);
+                let id = r.u8().map_err(bad)?;
+                let kind = r.string(128).map_err(bad)?.to_owned();
+                let title = crate::status::chat_text(r.string(64 * 1024).map_err(bad)?);
+                let own = usize::from(r.u8().map_err(bad)?);
+                // Its own slots, then the player's thirty-six, which the server sends as part
+                // of the same window.
+                self.open = Some(Window {
+                    id,
+                    kind,
+                    title,
+                    slots: vec![None; own + INVENTORY_SLOTS - 9],
+                    own,
+                });
             }
             CLOSE_WINDOW => {
-                self.window = 0;
+                self.open = None;
                 self.carried = None;
             }
             CONFIRM_TRANSACTION => {
@@ -915,6 +942,35 @@ impl Session {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Put a stack into whichever window the server meant.
+    ///
+    /// Window zero is always the player's own inventory, whatever else is open; any other number
+    /// is the container, and its slots run on into a copy of the player's inventory.
+    fn put(&mut self, window: i8, index: usize, stack: Option<Slot>) {
+        if window == 0 {
+            if index < self.inventory.len() {
+                self.inventory[index] = stack;
+            }
+            return;
+        }
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        if i8::try_from(open.id).unwrap_or(0) != window {
+            return;
+        }
+        if index < open.slots.len() {
+            open.slots[index] = stack;
+        }
+        // The tail of a container window is the player's own inventory, so keep the two in step
+        // or closing the chest shows a stale hotbar.
+        if let Some(player) = index.checked_sub(open.own)
+            && player < INVENTORY_SLOTS - 9
+        {
+            self.inventory[player + 9] = stack;
+        }
     }
 
     fn push_sound(&mut self, sound: Sound) {
@@ -1101,13 +1157,15 @@ impl Session {
     /// Click a slot in the open window. `button` is 0 left, 1 right; `mode` 0 is an ordinary
     /// click and 1 is shift-click.
     pub fn click_slot(&mut self, slot: i16, button: u8, mode: u8) -> io::Result<()> {
-        let window = self.window;
+        let window = self.open.as_ref().map_or(0, |open| open.id);
         self.actions = self.actions.wrapping_add(1);
         let action = self.actions;
-        let under = usize::try_from(slot)
-            .ok()
-            .and_then(|i| self.inventory.get(i).copied())
-            .flatten();
+        let index = usize::try_from(slot).ok();
+        let under = match (&self.open, index) {
+            (Some(open), Some(index)) => open.slots.get(index).copied().flatten(),
+            (None, Some(index)) => self.inventory.get(index).copied().flatten(),
+            _ => None,
+        };
         self.connection.send(
             OUT_CLICK_WINDOW,
             &body(|w: &mut Writer| {
@@ -1119,8 +1177,8 @@ impl Session {
 
     /// Shut whatever window is open.
     pub fn close_window(&mut self) -> io::Result<()> {
-        let window = self.window;
-        self.window = 0;
+        let window = self.open.as_ref().map_or(0, |open| open.id);
+        self.open = None;
         self.carried = None;
         self.connection.send(
             OUT_CLOSE_WINDOW,
@@ -1153,6 +1211,32 @@ impl Session {
             OUT_CLIENT_STATUS,
             &body(|w: &mut Writer| {
                 w.var_int(0);
+            }),
+        )
+    }
+
+    /// Hit something.
+    ///
+    /// 1.8 has no attack cooldown — a swing lands whenever it is sent, and that is the whole
+    /// reason this version still has players. The server works out the damage, the knockback and
+    /// whether it was a critical hit; the client's job is to say who and when.
+    pub fn attack(&mut self, entity: i32) -> io::Result<()> {
+        self.use_entity(entity, 1, None)
+    }
+
+    /// Right click something: mount it, trade with it, shear it.
+    pub fn interact(&mut self, entity: i32) -> io::Result<()> {
+        self.use_entity(entity, 0, None)
+    }
+
+    fn use_entity(&mut self, entity: i32, kind: i32, at: Option<[f32; 3]>) -> io::Result<()> {
+        self.connection.send(
+            OUT_USE_ENTITY,
+            &body(|w: &mut Writer| {
+                w.var_int(entity).var_int(kind);
+                if let Some([x, y, z]) = at {
+                    w.f32(x).f32(y).f32(z);
+                }
             }),
         )
     }
