@@ -25,7 +25,7 @@ mod sound;
 mod world;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use ninefold_protocol::physics::{Body, Input, TPS};
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The models say which textures exist, so the shapes are read before the atlas is packed.
     let mut shapes = shapes::Shapes::new(assets.clone());
     let wanted = shapes.every_texture();
-    let atlas = atlas::Atlas::build(assets.as_ref(), &wanted);
+    let atlas = Arc::new(atlas::Atlas::build(assets.as_ref(), &wanted));
     shapes.set_fallback(&atlas);
     let missing = wanted.iter().filter(|name| !atlas.has(name)).count();
     println!(
@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Every picture the client needs, loaded once before the window opens.
 struct Art {
-    atlas: atlas::Atlas,
+    atlas: Arc<atlas::Atlas>,
     items: items::Items,
     font: font::Font,
     /// The font's own picture, kept until the renderer exists to take it.
@@ -240,6 +240,15 @@ struct App {
     last_frame: Instant,
     /// Columns already given to the renderer, so only new or changed ones are meshed.
     meshed: HashSet<(i32, i32)>,
+    /// Columns being meshed on the other thread right now.
+    meshing: HashSet<(i32, i32)>,
+    /// The meshing thread: jobs out, finished columns back.
+    ///
+    /// Meshing a column costs four or five milliseconds and a frame at 120 is eight, so doing it
+    /// here is a visible hitch every time a chunk arrives. Gathering what it needs costs about
+    /// one, and that part has to be here because it reads the session.
+    jobs: mpsc::Sender<world::Job>,
+    finished: mpsc::Receiver<world::Finished>,
     /// Where each entity is being drawn, as against where the server last said it is.
     smoothed: HashMap<i32, [f64; 3]>,
     looking: bool,
@@ -305,6 +314,16 @@ impl App {
         shapes: shapes::Shapes,
         audio: sound::Audio,
     ) -> Self {
+        let (jobs, waiting) = mpsc::channel::<world::Job>();
+        let (done, finished) = mpsc::channel::<world::Finished>();
+        std::thread::spawn(move || {
+            // Ends when the client drops its end of either channel.
+            while let Ok(job) = waiting.recv() {
+                if done.send(world::build(job)).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             window: None,
             renderer: None,
@@ -330,6 +349,9 @@ impl App {
             owed: Duration::ZERO,
             last_frame: Instant::now(),
             meshed: HashSet::new(),
+            meshing: HashSet::new(),
+            jobs,
+            finished,
             smoothed: HashMap::new(),
             looking: false,
             mouse: (0.0, 0.0),
@@ -398,6 +420,7 @@ impl App {
                 self.followed_teleports = 0;
                 self.announced = false;
                 self.meshed.clear();
+                self.meshing.clear();
                 self.smoothed.clear();
                 if let Some(renderer) = &mut self.renderer {
                     renderer.set_mobs(&[], &[]);
@@ -429,6 +452,7 @@ impl App {
                 renderer.remove_column(at);
             }
         }
+        self.meshing.clear();
         self.smoothed.clear();
         if let Some(renderer) = &mut self.renderer {
             renderer.set_mobs(&[], &[]);
@@ -469,8 +493,29 @@ impl App {
     /// visible freeze when a handful arrive at once. A budget per frame spreads it out: terrain
     /// fills in over a few frames instead of the window locking up.
     fn mesh_some(&mut self) {
-        const PER_FRAME: usize = 2;
-        let Some(session) = &mut self.session else {
+        /// How many columns may be in the meshing thread's hands at once. More than this and a
+        /// burst of chunks arrives faster than it can keep up and the queue grows for ever.
+        const IN_FLIGHT: usize = 3;
+
+        // Whatever came back since the last frame, however long it took.
+        while let Ok(done) = self.finished.try_recv() {
+            self.meshing.remove(&done.at);
+            // A column can be meshed and then unloaded, or the whole world left, while the job
+            // was out. Geometry for a chunk nobody is in any more is not worth drawing.
+            let wanted = self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.columns.contains_key(&done.at));
+            if !wanted {
+                continue;
+            }
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_column(done.at, &done.vertices, &done.indices);
+            }
+            self.meshed.insert(done.at);
+        }
+
+        let Some(session) = &self.session else {
             return;
         };
 
@@ -488,6 +533,10 @@ impl App {
             }
         }
 
+        if self.meshing.len() >= IN_FLIGHT {
+            return;
+        }
+
         // New or changed columns, nearest first so what you are looking at fills in soonest.
         let here = (
             (self.body.x / 16.0).floor() as i32,
@@ -500,17 +549,21 @@ impl App {
             .copied()
             .filter(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2) <= limit * limit)
             .filter(|at| !self.meshed.contains(at) || session.dirty.contains(at))
+            .filter(|at| !self.meshing.contains(at))
             .collect();
         todo.sort_by_key(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2));
 
-        for at in todo.into_iter().take(PER_FRAME) {
-            let (vertices, indices) =
-                world::column(session, &self.art.atlas, &mut self.shapes, at);
-            if let Some(renderer) = &mut self.renderer {
-                renderer.set_column(at, &vertices, &indices);
+        for at in todo.into_iter().take(IN_FLIGHT - self.meshing.len()) {
+            let Some(session) = &self.session else {
+                return;
+            };
+            let job = world::prepare(session, &self.art.atlas, &mut self.shapes, at);
+            if self.jobs.send(job).is_ok() {
+                self.meshing.insert(at);
+                if let Some(session) = self.session.as_mut() {
+                    session.dirty.remove(&at);
+                }
             }
-            self.meshed.insert(at);
-            session.dirty.remove(&at);
         }
     }
 

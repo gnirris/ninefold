@@ -26,10 +26,12 @@ const LAYER: f32 = 0.0008;
 /// Every block state that has been baked, and the models they came from.
 pub struct Shapes {
     models: Models,
-    baked: HashMap<(u16, u8), Baked>,
+    /// Shared rather than owned, so a shape can be handed to the meshing thread without copying
+    /// it — a column needs a few dozen of them and they are not small.
+    baked: HashMap<(u16, u8), Arc<Baked>>,
     /// What an unmapped block is drawn as: a plain cube, so something unknown is visible rather
     /// than missing.
-    fallback: Baked,
+    fallback: Arc<Baked>,
 }
 
 impl Shapes {
@@ -38,7 +40,7 @@ impl Shapes {
         Self {
             models: Models::new(assets),
             baked: HashMap::new(),
-            fallback: Baked::default(),
+            fallback: Arc::new(Baked::default()),
         }
     }
 
@@ -93,25 +95,32 @@ impl Shapes {
             return;
         }
         let baked = self.bake(atlas, block, links);
-        self.baked.insert(key, baked);
+        self.baked.insert(key, Arc::new(baked));
     }
 
     /// The shape of a state that has already been prepared.
     #[must_use]
     pub fn get(&self, block: u16, links: Links) -> Option<&Baked> {
         let baked = self.baked.get(&(block, links.bits()))?;
-        (!baked.is_empty()).then_some(baked)
+        (!baked.is_empty()).then(|| baked.as_ref())
+    }
+
+    /// The same, to keep and send somewhere else.
+    #[must_use]
+    pub fn shared(&self, block: u16, links: Links) -> Option<Arc<Baked>> {
+        let baked = self.baked.get(&(block, links.bits()))?;
+        (!baked.is_empty()).then(|| baked.clone())
     }
 
     /// Build the fallback cube, once an atlas exists to point it at.
     pub fn set_fallback(&mut self, atlas: &Atlas) {
-        self.fallback = cube(atlas, "blocks/stone", 0);
+        self.fallback = Arc::new(cube(atlas, "blocks/stone", 0));
     }
 
     /// Anything with no model at all: a plain cube, so an unknown block is obvious.
     #[must_use]
-    pub fn fallback(&self) -> &Baked {
-        &self.fallback
+    pub fn fallback_shared(&self) -> Arc<Baked> {
+        self.fallback.clone()
     }
 
     /// How many distinct states have been baked.
@@ -520,7 +529,7 @@ mod tests {
     fn an_unknown_block_gets_a_cube_rather_than_nothing() {
         let (mut shapes, atlas) = shapes();
         shapes.set_fallback(&atlas);
-        assert_eq!(shapes.fallback().quads.len(), 6);
-        assert!(shapes.fallback().solid);
+        assert_eq!(shapes.fallback_shared().quads.len(), 6);
+        assert!(shapes.fallback_shared().solid);
     }
 }
