@@ -96,22 +96,6 @@ fn corners(face: Face, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
 /// Where each corner samples, in the order [`corners`] returns them.
 const CORNER_UV: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 
-/// The eight corners of a box, named by which side of the middle they are on.
-///
-/// The same ordering as [`corners`], written in terms of the box's own axes rather than the
-/// world's, so a box can be turned without a second winding convention to get wrong.
-const BOX_FACES: [([f32; 3], [[f32; 3]; 4]); 6] = [
-    // -c, +c
-    ([0.0, 0.0, -1.0], [[1.0, -1.0, -1.0], [-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0]]),
-    ([0.0, 0.0, 1.0], [[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]]),
-    // -a, +a
-    ([-1.0, 0.0, 0.0], [[-1.0, -1.0, -1.0], [-1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, 1.0, -1.0]]),
-    ([1.0, 0.0, 0.0], [[1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [1.0, 1.0, 1.0]]),
-    // +b, -b
-    ([0.0, 1.0, 0.0], [[-1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]]),
-    ([0.0, -1.0, 0.0], [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [-1.0, -1.0, 1.0]]),
-];
-
 /// A mesh being built.
 struct Build {
     vertices: Vec<Vertex>,
@@ -138,39 +122,6 @@ impl Build {
         }
         self.indices
             .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
-    }
-
-    /// A box turned to point somewhere, with the same picture on every side.
-    ///
-    /// `along` is the direction its long axis runs, in camera space.
-    fn turned(
-        &mut self,
-        basis: &Basis,
-        centre: [f32; 3],
-        shape: ([f32; 3], [f32; 3]),
-        tile: [f32; 4],
-        light: f32,
-    ) {
-        let (along, half) = shape;
-        let c = normalise(along);
-        let a = normalise(cross([0.0, 1.0, 0.0], c));
-        let b = cross(c, a);
-        let point = |[pa, pb, pc]: [f32; 3]| {
-            let local = [
-                centre[0] + a[0] * pa * half[0] + b[0] * pb * half[1] + c[0] * pc * half[2],
-                centre[1] + a[1] * pa * half[0] + b[1] * pb * half[1] + c[1] * pc * half[2],
-                centre[2] + a[2] * pa * half[0] + b[2] * pb * half[1] + c[2] * pc * half[2],
-            ];
-            basis.at(local)
-        };
-        for (axis, face) in BOX_FACES {
-            let normal = basis.way([
-                a[0] * axis[0] + b[0] * axis[1] + c[0] * axis[2],
-                a[1] * axis[0] + b[1] * axis[1] + c[1] * axis[2],
-                a[2] * axis[0] + b[2] * axis[1] + c[2] * axis[2],
-            ]);
-            self.quad(face.map(point), normal, tile, light);
-        }
     }
 
     fn finish(self) -> (Vec<Vertex>, Vec<u32>) {
@@ -201,6 +152,52 @@ pub fn cracks(atlas: &Atlas, at: (i32, i32, i32), stage: usize) -> (Vec<Vertex>,
     build.finish()
 }
 
+/// One step of the transform that puts something in the player's hand.
+///
+/// Applied innermost-last, the way a graphics stack does it: the list reads from the camera
+/// inwards, and a point goes through it backwards.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Move([f32; 3]),
+    /// Degrees about x, y or z, by the right-hand rule.
+    Turn(u8, f32),
+    Size(f32),
+}
+
+/// Put a point in item space through a chain of steps.
+fn through(point: [f32; 3], steps: &[Step]) -> [f32; 3] {
+    let mut p = point;
+    for step in steps.iter().rev() {
+        p = match *step {
+            Step::Move(by) => [p[0] + by[0], p[1] + by[1], p[2] + by[2]],
+            Step::Size(by) => [p[0] * by, p[1] * by, p[2] * by],
+            Step::Turn(axis, degrees) => {
+                let (sin, cos) = degrees.to_radians().sin_cos();
+                match axis {
+                    0 => [p[0], p[1] * cos - p[2] * sin, p[1] * sin + p[2] * cos],
+                    1 => [p[0] * cos + p[2] * sin, p[1], -p[0] * sin + p[2] * cos],
+                    _ => [p[0] * cos - p[1] * sin, p[0] * sin + p[1] * cos, p[2]],
+                }
+            }
+        };
+    }
+    p
+}
+
+/// The two curves 1.8 drives every first-person swing with.
+///
+/// Not one sine but two, against different arguments: `sin(swing² · π)` rises late and
+/// `sin(√swing · π)` rises early, and using them on different axes is what makes the hand arc
+/// out and back rather than simply bobbing. Guessing with a single sine — which is what this
+/// did before — looks like a hand on a spring.
+fn swing_curves(swing: f32) -> (f32, f32) {
+    let swing = swing.clamp(0.0, 1.0);
+    (
+        (swing * swing * std::f32::consts::PI).sin(),
+        (swing.sqrt() * std::f32::consts::PI).sin(),
+    )
+}
+
 /// Everything needed to draw whatever is in hand.
 pub struct Holding<'a> {
     pub atlas: &'a Atlas,
@@ -217,10 +214,15 @@ pub struct Holding<'a> {
     pub aspect: f32,
     /// The camera's vertical field of view, which the player can change.
     pub fov: f32,
+    /// How far down the hand is sitting while a new item comes up, 1 to 0.
+    pub equip: f32,
 }
 
 /// How much of the way to the corner of the view the hand sits.
 const TOWARDS_CORNER: f32 = 0.62;
+
+/// How far in front of the eye everything in hand is held. Vanilla's own number.
+const DEPTH: f32 = 0.72;
 
 impl Holding<'_> {
     /// Half the width and height the camera can see at a given distance in front of it.
@@ -229,51 +231,54 @@ impl Holding<'_> {
         (half_height * self.aspect.max(0.1), half_height)
     }
 
-    /// Where to put the middle of something, so that all of it stays on screen.
-    ///
-    /// `near` is how far away its closest part is, because the view narrows towards the camera
-    /// and that end is what leaves the frustum first. `reach` is how far it sticks out sideways
-    /// — its width, not its length. An arm is long and thin, and measuring it by its length
-    /// pushes it into the middle of the screen where its own length is not the problem.
-    fn corner(&self, near: f32, reach: f32) -> (f32, f32) {
-        let (wide, tall) = self.visible(near.max(0.05));
-        (
-            ((wide - reach).max(0.0)) * TOWARDS_CORNER,
-            -((tall - reach).max(0.0)) * TOWARDS_CORNER,
-        )
-    }
 }
 
 /// Build the hand in front of the camera.
 ///
 /// Returns which sheet the mesh samples from, because a block comes out of the block atlas, an
 /// item out of the item sheet and a bare arm out of the player's own skin.
+///
+/// The placement is 1.8's: 0.56 right, 0.52 down and 0.72 forward of the eye, dropped by the
+/// equip animation, turned 45 degrees, then swung by the two curves above on three axes. The one
+/// deliberate difference is that the sideways offset is scaled for the window's shape — vanilla's
+/// 0.56 sits 62% of the way to the edge of a 16:9 view and off the edge entirely of a tall one.
 #[must_use]
 pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet) {
-    // Vanilla's swing is an arc: the hand drops and comes back, moving towards the middle of
-    // the screen on the way. One sine for the arc and one for the dip is enough to read as the
-    // same motion.
-    let swing = what.swing.clamp(0.0, 1.0);
-    let arc = (swing * std::f32::consts::PI).sin();
-    let dip = (swing * std::f32::consts::TAU).sin();
+    let (late, early) = swing_curves(what.swing);
+    let equip = what.equip.clamp(0.0, 1.0);
     let light = what.light.clamp(0.35, 1.0);
+    // 0.56 at 16:9, and the same fraction of the view at any other shape.
+    let (wide, _) = what.visible(DEPTH);
+    let across = (wide * TOWARDS_CORNER).min(0.56);
+
+    // What every held thing shares, from the camera inwards.
+    let common = [
+        Step::Move([across, -0.52, -DEPTH]),
+        Step::Move([0.0, equip * -0.6, 0.0]),
+        Step::Turn(1, 45.0),
+        Step::Turn(1, late * -20.0),
+        Step::Turn(2, early * -20.0),
+        Step::Turn(0, early * -80.0),
+        Step::Size(0.4),
+    ];
 
     let block = what.held.and_then(Slot::as_block);
     if let Some(block) = block {
-        // A block is held as a block: a small cube, turned so three faces show.
-        let (depth, half) = (0.95, 0.13);
-        let (x, y) = what.corner(depth - half, half);
-        let centre = [x - arc * 0.12, y - arc * 0.14, -depth + dip * 0.05];
+        // A block keeps its own shape: the model's first-person transform is another 45 degrees
+        // and another four tenths, which is why a held block is small and seen corner-on.
+        let steps: Vec<Step> = common
+            .iter()
+            .copied()
+            .chain([Step::Turn(1, 45.0), Step::Size(0.4)])
+            .collect();
         let mut build = Build::new();
         for face in Face::ALL {
             let tile = what.atlas.rect(block, face);
-            let points = corners(
-                face,
-                [centre[0] - half, centre[1] - half, centre[2] - half],
-                [centre[0] + half, centre[1] + half, centre[2] + half],
-            )
-            .map(|point| basis.at(point));
-            let normal = basis.way(face.normal());
+            let points = corners(face, [-0.5, -0.5, -0.5], [0.5, 0.5, 0.5])
+                .map(|point| basis.at(through(point, &steps)));
+            // A turned cube's faces point wherever the chain left them, so the normal is taken
+            // from the geometry rather than from which face it started as.
+            let normal = face_normal(points, basis);
             build.quad(points, normal, tile, light);
         }
         let (vertices, indices) = build.finish();
@@ -283,46 +288,85 @@ pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet)
     if let Some(stack) = what.held
         && let Some(tile) = what.items.rect(stack.id, stack.damage)
     {
-        // An item is a flat picture, held at an angle and drawn from both sides.
-        let (depth, w, h) = (0.95, 0.17, 0.17);
-        let lean = 0.10 + arc * 0.06;
-        let (x, y) = what.corner(depth - lean, w);
-        let centre = [x - arc * 0.14, y - arc * 0.16, -depth];
-        let a = [centre[0] - w, centre[1] - h, centre[2] - lean];
-        let b = [centre[0] + w, centre[1] - h, centre[2] + lean];
-        let c = [centre[0] + w, centre[1] + h, centre[2] + lean];
-        let d = [centre[0] - w, centre[1] + h, centre[2] - lean];
+        // A flat item is the `generated` model: turned most of the way round, tipped, lifted
+        // four pixels and pushed out two, then scaled up — which is what points a sword up and
+        // to the left instead of lying flat across the view.
+        let steps: Vec<Step> = common
+            .iter()
+            .copied()
+            .chain([
+                Step::Move([0.0, 4.0 / 16.0, 2.0 / 16.0]),
+                Step::Turn(1, -135.0),
+                Step::Turn(2, 25.0),
+                Step::Size(1.7),
+            ])
+            .collect();
+        let quad = [
+            [-0.5, -0.5, 0.0],
+            [0.5, -0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [-0.5, 0.5, 0.0],
+        ]
+        .map(|point| basis.at(through(point, &steps)));
         let mut build = Build::new();
-        let front = basis.way([0.0, 0.0, 1.0]);
-        let back = [-front[0], -front[1], -front[2]];
-        build.quad([a, b, c, d].map(|p| basis.at(p)), front, tile, light);
-        build.quad([b, a, d, c].map(|p| basis.at(p)), back, tile, light);
+        let normal = face_normal(quad, basis);
+        let behind = [-normal[0], -normal[1], -normal[2]];
+        build.quad(quad, normal, tile, light);
+        let [a, b, c, d] = quad;
+        build.quad([b, a, d, c], behind, tile, light);
         let (vertices, indices) = build.finish();
         return (vertices, indices, Sheet::Items);
     }
 
-    // Nothing in hand: the arm itself, out of the player's own skin.
+    // Nothing in hand: the arm itself, out of the player's own skin. Vanilla swings this on its
+    // own chain — further round, and shoved across and down as it goes.
     let Some(skin) = what.skin else {
         return (Vec::new(), Vec::new(), Sheet::Mobs);
     };
-    let (depth, half_w, half_d) = (1.0f32, 0.055f32, 0.28f32);
-    let (x, y) = what.corner(depth - half_d, half_w);
-    let centre = [x - arc * 0.10, y - arc * 0.16, -depth + arc * 0.14];
-    // Vanilla's arm comes in from the bottom corner on the diagonal rather than lying flat
-    // along the view, which is what makes it read as an arm and not as a plank.
-    let along = [0.34, -0.42, 1.0];
-    let mut build = Build::new();
-    // The arm's own patch on a skin: four pixels across, twelve down, at (44, 20).
+    let steps = [
+        Step::Move([
+            early * -0.3,
+            (early * 2.0 * std::f32::consts::PI).sin() * 0.4,
+            late * -0.4,
+        ]),
+        Step::Move([across * 1.1, -0.62 - equip * 0.6, -DEPTH]),
+        Step::Turn(1, 45.0),
+        Step::Turn(1, early * 70.0),
+        Step::Turn(2, late * -20.0),
+        // The arm is a quarter of a block across and three quarters long, in block units.
+        Step::Size(0.25),
+    ];
     let tile = skin.patch([44.0, 20.0], [4.0, 12.0]);
-    build.turned(
-        basis,
-        centre,
-        (along, [half_w, half_w, half_d]),
-        tile,
-        light,
-    );
+    let mut build = Build::new();
+    for face in Face::ALL {
+        let points = corners(face, [-0.5, -0.5, -0.5], [0.5, 0.5, 2.6])
+            .map(|point| basis.at(through(point, &steps)));
+        let normal = face_normal(points, basis);
+        build.quad(points, normal, tile, light);
+    }
     let (vertices, indices) = build.finish();
     (vertices, indices, Sheet::Mobs)
+}
+
+/// Which way a quad faces, worked out from its own corners.
+///
+/// Needed because every one of these has been turned by the chain above, so where a face
+/// started out pointing says nothing about where it ends up.
+fn face_normal(points: [[f32; 3]; 4], basis: &Basis) -> [f32; 3] {
+    let edge = |a: usize, b: usize| {
+        [
+            points[a][0] - points[b][0],
+            points[a][1] - points[b][1],
+            points[a][2] - points[b][2],
+        ]
+    };
+    let normal = cross(edge(1, 0), edge(3, 0));
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if length < 1e-6 {
+        // A degenerate quad has no direction; face the viewer rather than nothing.
+        return basis.way([0.0, 0.0, 1.0]);
+    }
+    [normal[0] / length, normal[1] / length, normal[2] / length]
 }
 
 #[cfg(test)]
@@ -374,6 +418,7 @@ mod tests {
                 light: 1.0,
                 aspect: 1.78,
                 fov: 70.0,
+                equip: 0.0,
             },
         );
         assert_eq!(sheet, Sheet::Blocks);
@@ -411,6 +456,7 @@ mod tests {
                 light: 1.0,
                 aspect: 1.78,
                 fov: 70.0,
+                equip: 0.0,
             },
         );
         assert_eq!(sheet, Sheet::Items);
@@ -433,6 +479,7 @@ mod tests {
                     light: 1.0,
                     aspect: 1.78,
                     fov: 70.0,
+                    equip: 0.0,
                 },
             )
             .0[0]
@@ -449,11 +496,13 @@ mod tests {
     }
 
     #[test]
-    fn the_hand_stays_on_screen_whatever_shape_the_window_is() {
+    fn the_hand_is_in_the_corner_whatever_shape_the_window_is() {
         let atlas = Atlas::build(&Flat);
         let items = Items::build(&Flat);
-        // A tall window and a wide one. In both, the hand has to be inside what the camera can
-        // see — a fixed offset puts it off the side of a portrait window entirely.
+        // Vanilla holds things 0.52 below the eye at 0.72 away, and the view only reaches 0.50
+        // at that distance — so the held item really is cropped by the bottom of the screen, and
+        // a test demanding all of it be visible would be testing for the wrong thing. What has
+        // to hold is that it is down and to the right, and that some of it can be seen.
         for aspect in [0.6f32, 1.0, 1.78, 3.5] {
             let (vertices, ..) = held(
                 &basis(),
@@ -466,19 +515,27 @@ mod tests {
                     light: 1.0,
                     aspect,
                     fov: 70.0,
+                    equip: 0.0,
                 },
             );
+            let mut seen = 0;
+            let mut middle = [0.0f32; 3];
             for v in &vertices {
-                // Back into camera space: the basis looks along +z from the origin height.
+                // Back into camera space: the basis looks along +z from the eye's height.
                 let (x, y, z) = (v.position[0], v.position[1] - 70.0, v.position[2]);
                 let half_height = z * (70.0f32.to_radians() / 2.0).tan();
-                assert!(
-                    x.abs() <= half_height * aspect,
-                    "aspect {aspect}: x {x} outside {}",
-                    half_height * aspect
-                );
-                assert!(y.abs() <= half_height, "aspect {aspect}: y {y} off screen");
+                if x.abs() <= half_height * aspect && y.abs() <= half_height {
+                    seen += 1;
+                }
+                for (axis, total) in middle.iter_mut().enumerate() {
+                    *total += [x, y, z][axis] / vertices.len() as f32;
+                }
             }
+            assert!(seen > 0, "aspect {aspect}: none of the hand is on screen");
+            assert!(middle[1] < 0.0, "aspect {aspect}: the hand is not below the eye");
+            // The camera faces +z, so the viewer's right is world -x.
+            assert!(middle[0] < 0.0, "aspect {aspect}: the hand is not on the right");
+            assert!(middle[2] > 0.0, "aspect {aspect}: the hand is behind the camera");
         }
     }
 

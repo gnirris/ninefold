@@ -247,6 +247,10 @@ struct App {
     breaking: Option<(raycast::Hit, f32, f32)>,
     /// Ticks left in the arm's swing. Vanilla swings for six.
     swing: u32,
+    /// How far down the hand is while swapping what it holds, 1 to 0, and what it is currently
+    /// showing — which lags behind what is really held until the swap finishes.
+    equip: f32,
+    shown: Option<ninefold_protocol::item::Slot>,
     /// Is the left button down?
     swinging: bool,
     /// Ticks spent breaking, so the tool taps rather than hums.
@@ -317,6 +321,8 @@ impl App {
             hitboxes: false,
             breaking: None,
             swing: 0,
+            equip: 0.0,
+            shown: None,
             swinging: false,
             taps: 0,
             followed_teleports: 0,
@@ -656,6 +662,14 @@ impl App {
         }
 
         self.swing = self.swing.saturating_sub(1);
+        // Swapping what is held drops the hand out of view and brings the new thing up, which
+        // is one animation and not two: the item only changes once it is out of sight.
+        let current = session.held_item();
+        let target = if current == self.shown { 0.0 } else { 1.0 };
+        self.equip += (target - self.equip).clamp(-0.4, 0.4);
+        if self.equip > 0.9 {
+            self.shown = current;
+        }
         let moved = ((self.body.x - was.0).powi(2) + (self.body.z - was.1).powi(2)).sqrt();
         let under = session
             .block_at(
@@ -820,7 +834,8 @@ impl App {
                 self.body.z.floor() as i32,
             )) / 15.0
         });
-        let held = self.session.as_ref().and_then(Session::held_item);
+        // What the hand is showing, which during a swap is not what is held.
+        let held = self.shown;
         // Nothing in front of the camera while a menu is up, or the hand floats over the menu.
         let (vertices, indices, sheet) = if self.screen.modal() || self.session.is_none() {
             (Vec::new(), Vec::new(), ninefold_render::Sheet::Blocks)
@@ -836,6 +851,7 @@ impl App {
                     light,
                     aspect: self.size.0 as f32 / self.size.1.max(1) as f32,
                     fov: self.settings.fov,
+                    equip: self.equip,
                 },
             )
         };

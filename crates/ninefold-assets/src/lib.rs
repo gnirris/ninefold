@@ -54,6 +54,12 @@ pub trait AssetSource: Send + Sync {
     /// A texture by its name without extension, e.g. `blocks/grass_top`.
     fn texture(&self, id: &str) -> Option<Texture>;
 
+    /// A text file out of the assets, by its path under `assets/minecraft` — which is how the
+    /// block models and blockstates are read. Nothing but the real game has these.
+    fn text(&self, _id: &str) -> Option<String> {
+        None
+    }
+
     /// What to say in the UI about where the art is coming from.
     fn describe(&self) -> String;
 
@@ -117,6 +123,16 @@ impl AssetSource for Vanilla {
             height: rgba.height(),
             rgba: rgba.into_raw(),
         })
+    }
+
+    fn text(&self, id: &str) -> Option<String> {
+        let mut bytes = Vec::new();
+        {
+            let mut archive = self.archive.lock().ok()?;
+            let mut entry = archive.by_name(&format!("assets/minecraft/{id}")).ok()?;
+            entry.read_to_end(&mut bytes).ok()?;
+        }
+        String::from_utf8(bytes).ok()
     }
 
     fn describe(&self) -> String {
@@ -209,6 +225,25 @@ mod tests {
 
     /// Reads the player's actual 1.8.9 jar. Ignored by default because it needs the game
     /// installed; run with `cargo test -- --ignored` on a machine that has it.
+    /// The model files, which are what every block's shape comes from.
+    #[test]
+    #[ignore = "needs a real 1.8.9 install"]
+    fn the_real_jar_has_models_and_blockstates() {
+        let Some(jar) = Vanilla::usual_places().into_iter().next() else {
+            panic!("no 1.8.9 jar in the usual places");
+        };
+        let vanilla = Vanilla::open(&jar).expect("open the jar");
+        let stairs = vanilla
+            .text("models/block/stairs.json")
+            .expect("the stairs model");
+        assert!(stairs.contains("elements"), "a model has elements");
+        let state = vanilla
+            .text("blockstates/stone_stairs.json")
+            .expect("the stairs blockstate");
+        assert!(state.contains("facing=east"));
+        assert!(vanilla.text("models/block/nothing.json").is_none());
+    }
+
     #[test]
     #[ignore = "needs a real 1.8.9 install"]
     fn the_real_jar_gives_real_textures() {

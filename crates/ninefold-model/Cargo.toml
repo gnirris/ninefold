@@ -1,0 +1,15 @@
+[package]
+name = "ninefold-model"
+description = "Block shapes, read from the game's own model files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ninefold-assets = { path = "../ninefold-assets" }
+ninefold-mesh = { path = "../ninefold-mesh" }
+serde_json = "1.0.145"
+
+[lints.clippy]
+all = "deny"

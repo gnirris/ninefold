@@ -1098,6 +1098,15 @@ name = "ninefold-mesh"
 version = "0.0.1"
 
 [[package]]
+name = "ninefold-model"
+version = "0.0.1"
+dependencies = [
+ "ninefold-assets",
+ "ninefold-mesh",
+ "serde_json",
+]
+
+[[package]]
 name = "ninefold-mods"
 version = "0.0.1"
 dependencies = [
