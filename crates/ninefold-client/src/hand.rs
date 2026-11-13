@@ -97,6 +97,17 @@ fn corners(face: Face, from: [f32; 3], to: [f32; 3]) -> [[f32; 3]; 4] {
 /// Where each corner samples, in the order [`corners`] returns them.
 const CORNER_UV: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 
+/// The eight corners of a box, named by which side of the middle they are on, in the box's own
+/// axes rather than the world's — so a box can be turned without a second winding convention.
+const BOX_FACES: [([f32; 3], [[f32; 3]; 4]); 6] = [
+    ([0.0, 0.0, -1.0], [[1.0, -1.0, -1.0], [-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0]]),
+    ([0.0, 0.0, 1.0], [[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]]),
+    ([-1.0, 0.0, 0.0], [[-1.0, -1.0, -1.0], [-1.0, -1.0, 1.0], [-1.0, 1.0, 1.0], [-1.0, 1.0, -1.0]]),
+    ([1.0, 0.0, 0.0], [[1.0, -1.0, 1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [1.0, 1.0, 1.0]]),
+    ([0.0, 1.0, 0.0], [[-1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0]]),
+    ([0.0, -1.0, 0.0], [[-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, -1.0, 1.0], [-1.0, -1.0, 1.0]]),
+];
+
 /// A mesh being built.
 struct Build {
     vertices: Vec<Vertex>,
@@ -126,6 +137,40 @@ impl Build {
         }
         self.indices
             .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
+    }
+
+    /// A box pointing somewhere, with the same picture on every side.
+    ///
+    /// An arm is a limb, not a plank: it comes in from the corner of the view on a diagonal, and
+    /// a box that is simply turned about one axis reads as a slab lying across the screen.
+    /// `along` is the direction its long axis runs, in camera space.
+    fn turned(
+        &mut self,
+        basis: &Basis,
+        centre: [f32; 3],
+        shape: ([f32; 3], [f32; 3]),
+        tile: [f32; 4],
+        light: f32,
+    ) {
+        let (along, half) = shape;
+        let c = normalise(along);
+        let a = normalise(cross([0.0, 1.0, 0.0], c));
+        let b = cross(c, a);
+        let point = |[pa, pb, pc]: [f32; 3]| {
+            basis.at([
+                centre[0] + a[0] * pa * half[0] + b[0] * pb * half[1] + c[0] * pc * half[2],
+                centre[1] + a[1] * pa * half[0] + b[1] * pb * half[1] + c[1] * pc * half[2],
+                centre[2] + a[2] * pa * half[0] + b[2] * pb * half[1] + c[2] * pc * half[2],
+            ])
+        };
+        for (axis, face) in BOX_FACES {
+            let normal = basis.way([
+                a[0] * axis[0] + b[0] * axis[1] + c[0] * axis[2],
+                a[1] * axis[0] + b[1] * axis[1] + c[1] * axis[2],
+                a[2] * axis[0] + b[2] * axis[1] + c[2] * axis[2],
+            ]);
+            self.quad(face.map(point), normal, tile, light);
+        }
     }
 
     fn finish(self) -> (Vec<Vertex>, Vec<u32>) {
@@ -350,33 +395,17 @@ pub fn held(basis: &Basis, what: &Holding<'_>) -> (Vec<Vertex>, Vec<u32>, Sheet)
         return (Vec::new(), Vec::new(), Sheet::Mobs);
     };
     let (arm_x, arm_y) = what.corner(DEPTH - 0.1, 0.09);
-    let steps = [
-        Step::Move([
-            early * -0.3,
-            (early * 2.0 * std::f32::consts::PI).sin() * 0.4,
-            late * -0.4,
-        ]),
-        // Vanilla's own offset here is a fixed 0.75 below the eye, which is further down than a
-        // 70-degree view reaches at this distance — the arm is cropped by the bottom of the
-        // screen in the real game too, but cropped to nothing is not the same as cropped.
-        Step::Move([arm_x * 1.05, arm_y - 0.08 - equip * 0.6, -DEPTH]),
-        Step::Turn(1, 45.0),
-        Step::Turn(1, early * 70.0),
-        Step::Turn(2, late * -20.0),
-        // The arm is about a sixth of a block across and half a block long, in block units.
-        Step::Size(0.17),
+    // Vanilla swings the arm on its own curves: across and down as it comes round.
+    let centre = [
+        arm_x * 1.05 - early * 0.12,
+        arm_y - 0.06 - equip * 0.5 + (early * 2.0 * std::f32::consts::PI).sin() * 0.1,
+        -DEPTH + late * 0.12,
     ];
+    // In from the bottom corner on a diagonal, which is what makes it read as a limb.
+    let along = [0.34, -0.42, 1.0];
     let tile = skin.patch([44.0, 20.0], [4.0, 12.0]);
     let mut build = Build::new();
-    for face in Face::ALL {
-        // Reaching away from the camera, not towards it: local z is *back*, so the long end of
-        // the box is the negative one. The other way round puts the far end of the arm behind
-        // the near plane, where it fills the screen with one enormous sleeve.
-        let points = corners(face, [-0.5, -0.5, -2.6], [0.5, 0.5, 0.4])
-            .map(|point| basis.at(through(point, &steps)));
-        let normal = face_normal(points, basis);
-        build.quad(points, normal, tile, light);
-    }
+    build.turned(basis, centre, (along, [0.065, 0.065, 0.3]), tile, light);
     let (vertices, indices) = build.finish();
     (vertices, indices, Sheet::Mobs)
 }
