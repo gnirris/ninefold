@@ -35,4 +35,12 @@ command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$
 command -v gtk-update-icon-cache >/dev/null 2>&1 &&
     gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" || true
 
+# The example mods, but only into an empty directory: nothing here overwrites someone's own.
+mods="${XDG_CONFIG_HOME:-$HOME/.config}/ninefold/mods"
+mkdir -p "$mods"
+if [ -z "$(ls -A "$mods" 2>/dev/null)" ]; then
+    cp "$here"/packaging/mods/*.rhai "$mods/"
+    echo "example mods copied to $mods"
+fi
+
 echo "ninefold is in the application menu, with $server under it"

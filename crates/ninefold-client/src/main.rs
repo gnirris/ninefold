@@ -19,6 +19,7 @@ mod hand;
 mod items;
 mod models;
 mod screens;
+mod settings;
 mod sound;
 mod world;
 
@@ -31,7 +32,8 @@ use ninefold_protocol::play::{self, HOTBAR_START, Session};
 use ninefold_protocol::raycast;
 use ninefold_protocol::wire::Connection;
 use ninefold_render::Vertex;
-use screens::{Action, Screen};
+use screens::{Action, Field, Screen, Setting};
+use settings::Settings;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -40,8 +42,6 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// Where the camera sits above the player's feet.
 const EYE_HEIGHT: f64 = 1.62;
-/// Degrees of turn per pixel of mouse movement.
-const SENSITIVITY: f64 = 0.15;
 /// What the desktop knows this window as, matching `ninefold.desktop`.
 const APP_ID: &str = "ninefold";
 /// How long an arm swing lasts. Vanilla's is six ticks, and it is a recognisable six ticks.
@@ -57,15 +57,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let straight_in = args.iter().any(|a| a == "--join");
     let mut plain = args.iter().filter(|a| !a.starts_with("--"));
-    let target = plain
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:25565".to_owned());
-    let name = plain.next().cloned().unwrap_or_else(|| "ninefold".to_owned());
-    let (host, port) = match target.rsplit_once(':') {
-        Some((host, port)) => (host.to_owned(), port.parse().unwrap_or(25565)),
-        None => (target.clone(), 25565),
-    };
+    // What is on the command line wins for this run, and is deliberately not written back: a
+    // launcher entry or a test script passing a server must not quietly replace the one the
+    // player chose in the menu. Only the menus save.
+    let mut chosen = Settings::load();
+    if let Some(target) = plain.next() {
+        chosen.server.clone_from(target);
+    }
+    if let Some(name) = plain.next() {
+        chosen.username.clone_from(name);
+    }
+    println!("settings: {}", Settings::path().display());
 
     let assets = ninefold_assets::pick(None);
     println!("textures: {}", assets.describe());
@@ -83,6 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let sheets = gui::sheets(assets.as_ref());
     let mobs = mob_sheet(assets.as_ref());
+    // Loaded once, here, and handed over: loading them twice runs every `on_load` twice.
+    let mods = ninefold_mods::Mods::load();
+    if mods.is_empty() {
+        println!("mods: none in {}", mods.directory.display());
+    } else {
+        println!("mods: {}", mods.names().join(", "));
+    }
     let audio = sound::Audio::open();
     if audio.working() {
         println!("sound: {}", audio.describe());
@@ -104,13 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sheets,
             mobs,
         },
-        Server {
-            host,
-            port,
-            name,
-            shown: target,
-            straight_in,
-        },
+        chosen,
+        straight_in,
+        mods,
         audio,
     );
     event_loop.run_app(&mut app)?;
@@ -126,17 +131,6 @@ struct Art {
     font_sheet: Option<ninefold_assets::Texture>,
     sheets: gui::Sheets,
     mobs: Mobs,
-}
-
-/// Where we are trying to connect to.
-struct Server {
-    host: String,
-    port: u16,
-    name: String,
-    /// What to call it on the title screen.
-    shown: String,
-    /// Skip the title screen entirely.
-    straight_in: bool,
 }
 
 /// Every mob texture in one sheet, with where each one landed.
@@ -193,7 +187,16 @@ struct App {
     window: Option<std::sync::Arc<Window>>,
     renderer: Option<ninefold_render::Renderer>,
     art: Art,
-    server: Server,
+    settings: Settings,
+    /// Connect without showing the title screen first.
+    straight_in: bool,
+    /// Which box on a menu is being typed into.
+    focus: Option<Field>,
+    /// Scripted mods, and how much of the chat they have been shown.
+    mods: ninefold_mods::Mods,
+    chat_seen: usize,
+    /// What the mods want drawn this frame.
+    mod_hud: Vec<String>,
     audio: sound::Audio,
 
     /// Which screen is in front of the world, and the world itself once there is one.
@@ -269,12 +272,23 @@ struct Held {
 }
 
 impl App {
-    fn new(art: Art, server: Server, audio: sound::Audio) -> Self {
+    fn new(
+        art: Art,
+        settings: Settings,
+        straight_in: bool,
+        mods: ninefold_mods::Mods,
+        audio: sound::Audio,
+    ) -> Self {
         Self {
             window: None,
             renderer: None,
             art,
-            server,
+            settings,
+            straight_in,
+            focus: None,
+            mods,
+            chat_seen: 0,
+            mod_hud: Vec::new(),
             audio,
             screen: Screen::Title,
             session: None,
@@ -317,14 +331,11 @@ impl App {
         if self.connecting.is_some() {
             return;
         }
-        let (host, port, name) = (
-            self.server.host.clone(),
-            self.server.port,
-            self.server.name.clone(),
-        );
+        let (host, port) = self.settings.target();
+        let name = self.settings.username.clone();
         // The error the OS gives says what went wrong and not where, and "connection refused"
         // with no address is the least useful thing a client can tell you.
-        let shown = self.server.shown.clone();
+        let shown = self.settings.server.clone();
         let (send, receive) = mpsc::channel();
         std::thread::spawn(move || {
             let outcome = ninefold_protocol::login::login(&host, port, &name)
@@ -452,10 +463,12 @@ impl App {
             (self.body.x / 16.0).floor() as i32,
             (self.body.z / 16.0).floor() as i32,
         );
+        let limit = i32::from(self.settings.render_distance);
         let mut todo: Vec<(i32, i32)> = session
             .columns
             .keys()
             .copied()
+            .filter(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2) <= limit * limit)
             .filter(|at| !self.meshed.contains(at) || session.dirty.contains(at))
             .collect();
         todo.sort_by_key(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2));
@@ -737,6 +750,60 @@ impl App {
         boxes
     }
 
+    /// Give the mods their turn: the hooks they asked for, then whatever they asked us to do.
+    fn tick_mods(&mut self) {
+        if self.mods.is_empty() {
+            self.mod_hud.clear();
+            return;
+        }
+        let context = match &self.session {
+            Some(session) => ninefold_mods::Context {
+                x: self.body.x,
+                y: self.body.y,
+                z: self.body.z,
+                yaw: self.yaw.rem_euclid(360.0),
+                pitch: self.pitch,
+                health: session.health,
+                food: session.food,
+                held: session.held,
+                fps: self.fps,
+                on_ground: self.body.on_ground,
+                day_time: session.day_time,
+            },
+            None => ninefold_mods::Context {
+                fps: self.fps,
+                ..ninefold_mods::Context::default()
+            },
+        };
+
+        // Anything said since the last look, and anything that changed.
+        let (said, changed) = match self.session.as_mut() {
+            Some(session) => {
+                let said: Vec<String> = session.chat.get(self.chat_seen..).unwrap_or(&[]).to_vec();
+                self.chat_seen = session.chat.len();
+                (said, std::mem::take(&mut session.changes))
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        for line in said {
+            self.mods.chat(&line);
+        }
+        for (x, y, z, block) in changed {
+            self.mods.block((x, y, z), block);
+        }
+        self.mods.tick(context);
+
+        let asked = self.mods.drain();
+        self.mod_hud = asked.hud;
+        for line in asked.say {
+            if let Some(session) = self.session.as_mut()
+                && let Err(e) = session.say(&line)
+            {
+                eprintln!("a mod could not say that: {e}");
+            }
+        }
+    }
+
     /// The hand in front of the camera, and the cracks on whatever is being broken.
     fn build_hand(&mut self) {
         let facing = ninefold_render::camera::facing(self.yaw as f32, self.pitch as f32);
@@ -768,6 +835,7 @@ impl App {
                     swing: 1.0 - self.swing as f32 / SWING_TICKS as f32,
                     light,
                     aspect: self.size.0 as f32 / self.size.1.max(1) as f32,
+                    fov: self.settings.fov,
                 },
             )
         };
@@ -801,6 +869,9 @@ impl App {
             self.meshed.len(),
             self.audio.describe()
         ));
+        if !self.mods.is_empty() {
+            lines.push(format!("mods: {}", self.mods.names().join(", ")));
+        }
         let Some(session) = &self.session else {
             return lines;
         };
@@ -862,12 +933,16 @@ impl App {
         };
 
         self.hits = match self.screen {
-            Screen::Title => screens::title(&mut ui, &self.art.font, mouse, &self.server.shown),
+            Screen::Title => screens::title(&mut ui, &self.art.font, mouse, &self.settings.server),
+            Screen::Multiplayer => {
+                screens::multiplayer(&mut ui, &self.art.font, mouse, &self.settings, self.focus)
+            }
+            Screen::Options => screens::options(&mut ui, &self.art.font, mouse, &self.settings),
             Screen::Connecting => {
                 screens::connecting(
                     &mut ui,
                     &self.art.font,
-                    &self.server.shown,
+                    &self.settings.server,
                     self.since.elapsed().as_secs_f32(),
                 );
                 Vec::new()
@@ -899,8 +974,11 @@ impl App {
             }
         };
 
-        if self.debug {
-            screens::debug(&mut ui, &self.art.font, &self.readout());
+        // The readout first, then anything the mods want to say, under it.
+        let mut lines = if self.debug { self.readout() } else { Vec::new() };
+        lines.extend(self.mod_hud.iter().cloned());
+        if !lines.is_empty() {
+            screens::debug(&mut ui, &self.art.font, &lines);
         }
 
         if let Some(renderer) = &mut self.renderer {
@@ -936,6 +1014,10 @@ impl App {
                 hotbar,
             },
         );
+        // Whatever the server is keeping score of, down the right.
+        if let Some((title, lines)) = session.scoreboard.sidebar() {
+            screens::sidebar(ui, &self.art.font, &title, &lines);
+        }
         let typing = if self.screen == Screen::Chat {
             Some(self.typed.as_str())
         } else {
@@ -956,7 +1038,20 @@ impl App {
         };
         self.audio.here("random.click", 0.3, 1.0);
         match hit.action {
-            Action::Connect => self.connect(),
+            Action::Connect => {
+                self.settings.save();
+                self.connect();
+            }
+            Action::Go(screen) => {
+                self.focus = None;
+                self.settings.save();
+                self.screen = screen;
+            }
+            Action::Edit(field) => self.focus = Some(field),
+            Action::Step(setting) => {
+                self.step(setting);
+                self.apply_settings();
+            }
             Action::Resume => {
                 self.screen = Screen::None;
                 self.grab(true);
@@ -1012,8 +1107,126 @@ impl App {
         }
     }
 
+    /// Move one setting on to its next value, wrapping round at the end the way vanilla's
+    /// buttons do.
+    fn step(&mut self, setting: Setting) {
+        let settings = &mut self.settings;
+        match setting {
+            Setting::Render => {
+                settings.render_distance = match settings.render_distance {
+                    0..=3 => 4,
+                    4..=7 => 8,
+                    8..=11 => 12,
+                    12..=15 => 16,
+                    16..=23 => 24,
+                    _ => 2,
+                };
+            }
+            Setting::Sensitivity => {
+                settings.sensitivity += 0.05;
+                if settings.sensitivity > 0.56 {
+                    settings.sensitivity = 0.05;
+                }
+            }
+            Setting::Fov => {
+                settings.fov += 10.0;
+                if settings.fov > 110.0 {
+                    settings.fov = 30.0;
+                }
+            }
+            Setting::Volume => {
+                settings.volume -= 0.25;
+                if settings.volume < -0.01 {
+                    settings.volume = 1.0;
+                }
+            }
+            Setting::Fullscreen => settings.fullscreen = !settings.fullscreen,
+        }
+    }
+
+    /// Push the settings out to the things that act on them.
+    fn apply_settings(&mut self) {
+        self.audio.set_volume(self.settings.volume);
+        let far = f32::from(self.settings.render_distance) * 16.0;
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_view(self.settings.fov, far);
+        }
+        if let Some(window) = &self.window {
+            window.set_fullscreen(
+                self.settings
+                    .fullscreen
+                    .then_some(winit::window::Fullscreen::Borderless(None)),
+            );
+        }
+        // Columns past the new limit stop being drawn at once rather than at the next reload.
+        let here = (
+            (self.body.x / 16.0).floor() as i32,
+            (self.body.z / 16.0).floor() as i32,
+        );
+        let limit = i32::from(self.settings.render_distance);
+        let gone: Vec<_> = self
+            .meshed
+            .iter()
+            .copied()
+            .filter(|at| (at.0 - here.0).pow(2) + (at.1 - here.1).pow(2) > limit * limit)
+            .collect();
+        for at in gone {
+            self.meshed.remove(&at);
+            if let Some(renderer) = &mut self.renderer {
+                renderer.remove_column(at);
+            }
+        }
+    }
+
+    /// A key typed into one of the boxes on a menu.
+    fn field_key(&mut self, code: KeyCode, text: Option<&str>) {
+        let Some(field) = self.focus else {
+            return;
+        };
+        let limit = match field {
+            Field::Username => 16,
+            Field::Server => 64,
+        };
+        let value = match field {
+            Field::Username => &mut self.settings.username,
+            Field::Server => &mut self.settings.server,
+        };
+        match code {
+            KeyCode::Escape | KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Tab => {
+                self.focus = None;
+                self.settings.save();
+            }
+            KeyCode::Backspace => {
+                value.pop();
+            }
+            _ => {
+                if let Some(text) = text {
+                    for character in text.chars() {
+                        // A server address and a name are both plain text, and letting anything
+                        // else in only produces a connection that cannot work.
+                        let allowed = match field {
+                            Field::Username => character.is_ascii_alphanumeric() || character == '_',
+                            Field::Server => {
+                                character.is_ascii_alphanumeric()
+                                    || matches!(character, '.' | ':' | '-' | '_')
+                            }
+                        };
+                        if allowed && value.chars().count() < limit {
+                            value.push(character);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A key, in the game rather than in a menu.
     fn play_key(&mut self, code: KeyCode, down: bool) {
+        // Mods see every key press, including the ones the client also acts on, because a mod
+        // binding F to something is the single most common thing a client mod does.
+        if down && !self.mods.is_empty() {
+            self.mods.key(&format!("{code:?}"));
+        }
         let dead = self.session.as_ref().is_some_and(|s| s.dead);
         match code {
             // Before the plain Space arm, or the guard never gets a look in.
@@ -1164,7 +1377,8 @@ impl ApplicationHandler for App {
             renderer.set_mob_sheet(art.mobs.width, art.mobs.height, &art.mobs.rgba);
         }
         self.window = Some(window);
-        if self.server.straight_in {
+        self.apply_settings();
+        if self.straight_in {
             self.connect();
         }
     }
@@ -1260,6 +1474,24 @@ impl ApplicationHandler for App {
                             self.grab(true);
                         }
                     }
+                    Screen::Multiplayer if down => {
+                        if self.focus.is_some() {
+                            let text = event.text.as_ref().map(|t| t.as_str());
+                            self.field_key(code, text);
+                        } else if code == KeyCode::Escape {
+                            self.settings.save();
+                            self.screen = Screen::Title;
+                        } else if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+                            self.settings.save();
+                            self.connect();
+                        }
+                    }
+                    Screen::Options if down => {
+                        if code == KeyCode::Escape {
+                            self.settings.save();
+                            self.screen = Screen::Title;
+                        }
+                    }
                     Screen::Title | Screen::Lost if down => {
                         if code == KeyCode::Escape {
                             event_loop.exit();
@@ -1280,9 +1512,10 @@ impl ApplicationHandler for App {
             && self.looking
             && !self.screen.modal()
         {
-            self.yaw += delta.0 * SENSITIVITY;
+            let sensitivity = f64::from(self.settings.sensitivity);
+            self.yaw += delta.0 * sensitivity;
             // Straight up and straight down, and no further: past vertical the view flips.
-            self.pitch = (self.pitch + delta.1 * SENSITIVITY).clamp(-89.9, 89.9);
+            self.pitch = (self.pitch + delta.1 * sensitivity).clamp(-89.9, 89.9);
         }
     }
 
@@ -1345,6 +1578,7 @@ impl App {
             self.tick_breaking();
         }
         self.tick_sounds();
+        self.tick_mods();
 
         // What is under the crosshair.
         if self.session.is_some() && !self.screen.modal() {

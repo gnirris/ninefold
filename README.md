@@ -37,7 +37,7 @@ multi-year target, built in order of what can be proved:
 |---|---|---|
 | 1 | Protocol 47: codec, handshake, status, login | **done** |
 | 2 | Headless join: chunks decoded, 1.8 movement prediction, walk a real server | **done** |
-| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain, biome colour, crossed-sprite plants, mob and player models, the vanilla HUD and menus, inventory, placing, sound |
+| 3 | Rendering: terrain meshing, entities, HUD | **in progress** — textured terrain, biome colour, crossed-sprite plants, mob and player models, a first-person hand, the vanilla HUD, menus and scoreboard, inventory, placing, sound, scripted mods |
 | 4 | Singleplayer: world storage, worldgen, mob AI, redstone | |
 
 Phase 2 is the one that decides whether the rest is worth building. It needs no renderer, and a
@@ -265,10 +265,56 @@ Items in a slot are drawn two ways, because the game draws them two ways: an ite
 picture of its own in `textures/items`, and a block has none at all and is built as a little cube
 out of its own faces.
 
+## Joining a server
+
+The title screen's **Multiplayer** has two boxes: an address and a name. There is no account and
+no session check, so the name is whatever you say it is — which works on a server running
+`online-mode=false` and nowhere else. The screen says so, rather than leaving it for a confusing
+refusal at login.
+
+Premium servers need a Mojang session to join, which means an access token and a call to
+Mojang's session server. ninefold does not do that yet and does not hold anyone's token.
+
+**Options** covers render distance, sensitivity, field of view, sound and fullscreen. Everything
+is kept in `~/.config/ninefold/settings.txt`, one `key=value` to a line, in a format that can be
+fixed in a text editor when a client writes something stupid into it.
+
 ## Mods
 
 Java mods will never work here. Forge, Fabric, OptiFine and anything else that loads into the JVM
 has no JVM to load into. That is a consequence of the rewrite, not a gap to be filled later.
+
+So mods are the other kind: scripts the client runs itself, from
+`~/.config/ninefold/mods/*.rhai`. A mod defines any of these and the client calls them:
+
+```text
+fn on_load()                    once, when the mod is read
+fn on_tick(game)                twenty times a second, with the player's state
+fn on_chat(line)                whenever something is said
+fn on_key(key)                  when a key goes down, as "KeyF", "KeyG", …
+fn on_block(x, y, z, block)     when a block changes
+```
+
+and calls `hud(text)` to add a line to the screen, `say(text)` to send chat, `log(text)` to write
+to the console, and `store(key, value)` / `recall(key)` to remember something between ticks —
+which a mod needs, because a rhai function cannot see a variable declared at the top of its own
+file. Each mod gets its own drawer, so two of them cannot tread on each other's keys.
+
+That covers what client mods are actually written for: a readout, a keybind, a toggle, something
+that watches the chat. There is no filesystem and no network in a script, because those functions
+are simply not registered; a runaway loop is stopped by an operation limit rather than hanging
+the game, and a mod that throws is reported once and switched off rather than failing twenty
+times a second.
+
+Two examples ship in [`packaging/mods`](packaging/mods) and are copied into place on first
+install.
+
+## Scoreboards
+
+The sidebar servers use for ranks, coins and map names: objectives, scores and teams, drawn
+right-aligned and vertically centred as vanilla lays it out. Teams matter more than they look —
+on a 1.8 lobby the entries are often empty strings decorated entirely by a team's prefix and
+suffix, so without them a sidebar comes out as a column of blanks.
 
 ## Build
 

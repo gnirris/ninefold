@@ -277,6 +277,9 @@ pub struct Renderer {
     block_icons: Option<(wgpu::Buffer, u32)>,
     sky: [f32; 3],
     daylight: f32,
+    /// Vertical field of view in degrees, and how far the world is drawn.
+    fov: f32,
+    far: f32,
 }
 
 impl Renderer {
@@ -576,6 +579,8 @@ impl Renderer {
             block_icons: None,
             sky: SKY,
             daylight: 1.0,
+            fov: 70.0,
+            far: FAR,
         })
     }
 
@@ -680,6 +685,15 @@ impl Renderer {
     #[must_use]
     pub fn aspect(&self) -> f32 {
         self.config.width as f32 / self.config.height.max(1) as f32
+    }
+
+    /// How wide the view is and how far it reaches.
+    ///
+    /// The fog has to end before the far plane or chunks appear at full brightness right at the
+    /// edge of the world, so both move together.
+    pub fn set_view(&mut self, fov_degrees: f32, far_blocks: f32) {
+        self.fov = fov_degrees.clamp(30.0, 110.0);
+        self.far = far_blocks.clamp(32.0, 1024.0);
     }
 
     /// What colour the sky is, and how bright the day is. Night is both darker and bluer.
@@ -818,7 +832,7 @@ impl Renderer {
     /// Draw one frame from the given eye.
     pub fn draw(&mut self, eye: [f32; 3], direction: [f32; 3]) {
         let view = camera::look_to(eye, direction, [0.0, 1.0, 0.0]);
-        let projection = camera::perspective(70.0, self.aspect(), 0.05, FAR);
+        let projection = camera::perspective(self.fov, self.aspect(), 0.05, self.far);
         self.queue.write_buffer(
             &self.uniforms,
             0,
@@ -826,9 +840,9 @@ impl Renderer {
                 view_projection: camera::multiply(view, projection),
                 // Afternoon sun, slightly off to one side so the faces of a cube differ.
                 sun: [0.4, 0.9, 0.25, 0.0],
-                eye: [eye[0], eye[1], eye[2], FAR],
+                eye: [eye[0], eye[1], eye[2], self.far],
                 sky: [self.sky[0], self.sky[1], self.sky[2], 1.0],
-                world: [self.daylight, FAR, 0.0, 0.0],
+                world: [self.daylight, self.far, 0.0, 0.0],
             }),
         );
 

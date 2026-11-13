@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ninefold-assets = { path = "../ninefold-assets" }
 ninefold-mesh = { path = "../ninefold-mesh" }
+ninefold-mods = { path = "../ninefold-mods" }
 ninefold-protocol = { path = "../ninefold-protocol" }
 ninefold-render = { path = "../ninefold-render" }
 ninefold-sound = { path = "../ninefold-sound" }

@@ -48,6 +48,10 @@ const CLOSE_WINDOW: i32 = 0x2E;
 const SET_SLOT: i32 = 0x2F;
 const WINDOW_ITEMS: i32 = 0x30;
 const CONFIRM_TRANSACTION: i32 = 0x32;
+const SCOREBOARD_OBJECTIVE: i32 = 0x3B;
+const UPDATE_SCORE: i32 = 0x3C;
+const DISPLAY_SCOREBOARD: i32 = 0x3D;
+const TEAMS: i32 = 0x3E;
 const PLAYER_LIST_ITEM: i32 = 0x38;
 const PLAYER_ABILITIES: i32 = 0x39;
 const DISCONNECT: i32 = 0x40;
@@ -118,6 +122,75 @@ impl Kind {
     }
 }
 
+/// A scoreboard, as the server builds it up packet by packet.
+///
+/// Servers use this for far more than scores: on a 1.8 server the sidebar is how a lobby shows
+/// your rank, your coins and the map name, and the entries are often empty strings decorated
+/// entirely by team prefixes. So a usable scoreboard needs the teams as well, or the sidebar
+/// comes out as a column of blanks.
+#[derive(Debug, Default, Clone)]
+pub struct Scoreboard {
+    /// Objective name to the title it is displayed under.
+    titles: HashMap<String, String>,
+    /// Objective name, then entry name, to score.
+    scores: HashMap<String, HashMap<String, i32>>,
+    /// Which objective is shown down the right-hand side, if any.
+    sidebar: Option<String>,
+    /// Team name to what it puts around its members' names.
+    teams: HashMap<String, Team>,
+}
+
+/// What a team does to the names in it.
+#[derive(Debug, Default, Clone)]
+struct Team {
+    prefix: String,
+    suffix: String,
+    members: Vec<String>,
+}
+
+impl Scoreboard {
+    /// The sidebar's title and its lines, highest score first.
+    ///
+    /// Vanilla shows fifteen lines at most and takes them from the top, which is why a server
+    /// with sixteen things to say always drops the last one.
+    #[must_use]
+    pub fn sidebar(&self) -> Option<(String, Vec<(String, i32)>)> {
+        let objective = self.sidebar.as_ref()?;
+        let title = self.titles.get(objective)?.clone();
+        let mut lines: Vec<(String, i32)> = self
+            .scores
+            .get(objective)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|(entry, score)| (self.decorate(entry), *score))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Highest first, and alphabetically where two are equal so the order does not jitter.
+        lines.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        lines.truncate(15);
+        Some((title, lines))
+    }
+
+    /// A name with whatever its team puts around it.
+    #[must_use]
+    pub fn decorate(&self, entry: &str) -> String {
+        for team in self.teams.values() {
+            if team.members.iter().any(|member| member == entry) {
+                return format!("{}{}{}", team.prefix, entry, team.suffix);
+            }
+        }
+        entry.to_owned()
+    }
+
+    /// Is there anything to draw?
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.sidebar.is_none()
+    }
+}
+
 /// Something the server asked to be heard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sound {
@@ -174,6 +247,8 @@ pub struct Session {
     pub columns: HashMap<(i32, i32), Column>,
     /// Columns whose blocks have changed since they were last drawn.
     pub dirty: std::collections::HashSet<(i32, i32)>,
+    /// Individual block changes, for anything watching them. Drained by whoever reads it.
+    pub changes: Vec<(i32, i32, i32, u16)>,
     /// Everything else in the world, by the server's entity id.
     pub entities: HashMap<i32, Entity>,
     /// Our own entity id, so we can tell our own packets from everyone else's.
@@ -215,6 +290,8 @@ pub struct Session {
     pub hurt: bool,
     /// Names from the tab list, by UUID, so a spawning player can be labelled.
     names: HashMap<[u8; 16], String>,
+    /// Whatever the server is keeping score of.
+    pub scoreboard: Scoreboard,
     /// The window the server has opened over the inventory, if any.
     pub window: u8,
     /// Rolling counter for window clicks, which the server echoes back.
@@ -232,6 +309,7 @@ impl Session {
             keep_alives: 0,
             columns: HashMap::new(),
             dirty: std::collections::HashSet::new(),
+            changes: Vec::new(),
             entities: HashMap::new(),
             entity_id: 0,
             chat: Vec::new(),
@@ -253,6 +331,7 @@ impl Session {
             pushed: None,
             hurt: false,
             names: HashMap::new(),
+            scoreboard: Scoreboard::default(),
             window: 0,
             actions: 0,
         }
@@ -417,6 +496,62 @@ impl Session {
             }
             PLAYER_LIST_ITEM => {
                 self.read_player_list(&payload)?;
+            }
+            SCOREBOARD_OBJECTIVE => {
+                let mut r = Reader::new(&payload);
+                let name = r.string(64).map_err(bad)?.to_owned();
+                let mode = r.u8().map_err(bad)?;
+                match mode {
+                    // Created or updated: the rest is its title and how it is rendered.
+                    0 | 2 => {
+                        let title = r.string(128).map_err(bad)?.to_owned();
+                        self.scoreboard.titles.insert(name, title);
+                    }
+                    1 => {
+                        self.scoreboard.titles.remove(&name);
+                        self.scoreboard.scores.remove(&name);
+                        if self.scoreboard.sidebar.as_ref() == Some(&name) {
+                            self.scoreboard.sidebar = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            UPDATE_SCORE => {
+                let mut r = Reader::new(&payload);
+                let entry = r.string(160).map_err(bad)?.to_owned();
+                let action = r.u8().map_err(bad)?;
+                let objective = r.string(64).map_err(bad)?.to_owned();
+                if action == 1 {
+                    // Removed from one objective, or from every one if none is named.
+                    if objective.is_empty() {
+                        for scores in self.scoreboard.scores.values_mut() {
+                            scores.remove(&entry);
+                        }
+                    } else if let Some(scores) = self.scoreboard.scores.get_mut(&objective) {
+                        scores.remove(&entry);
+                    }
+                } else {
+                    let value = r.var_int().map_err(bad)?;
+                    self.scoreboard
+                        .scores
+                        .entry(objective)
+                        .or_default()
+                        .insert(entry, value);
+                }
+            }
+            DISPLAY_SCOREBOARD => {
+                let mut r = Reader::new(&payload);
+                let position = r.u8().map_err(bad)?;
+                let name = r.string(64).map_err(bad)?.to_owned();
+                // 0 is the player list, 1 the sidebar, 2 under the name. Only the sidebar is
+                // drawn, and an empty name means "stop showing one".
+                if position == 1 {
+                    self.scoreboard.sidebar = (!name.is_empty()).then_some(name);
+                }
+            }
+            TEAMS => {
+                self.read_teams(&payload)?;
             }
             SPAWN_PLAYER => {
                 let mut r = Reader::new(&payload);
@@ -733,6 +868,55 @@ impl Session {
         Ok(())
     }
 
+    /// Teams, which on a 1.8 server are mostly a way of putting colour round a name.
+    fn read_teams(&mut self, payload: &[u8]) -> io::Result<()> {
+        let mut r = Reader::new(payload);
+        let name = r.string(64).map_err(bad)?.to_owned();
+        let mode = r.u8().map_err(bad)?;
+        match mode {
+            // Created, or had its details changed: display name, prefix, suffix, then flags.
+            0 | 2 => {
+                let _display = r.string(128).map_err(bad)?;
+                let prefix = r.string(128).map_err(bad)?.to_owned();
+                let suffix = r.string(128).map_err(bad)?.to_owned();
+                let team = self.scoreboard.teams.entry(name).or_default();
+                team.prefix = prefix;
+                team.suffix = suffix;
+                if mode == 0 {
+                    // A new team also lists who is in it; an update does not.
+                    let _flags = r.u8().map_err(bad)?;
+                    let _visibility = r.string(64).map_err(bad)?;
+                    let _colour = r.u8().map_err(bad)?;
+                    let count = r.var_int().map_err(bad)?.clamp(0, 1024);
+                    let mut members = Vec::new();
+                    for _ in 0..count {
+                        members.push(r.string(64).map_err(bad)?.to_owned());
+                    }
+                    team.members = members;
+                }
+            }
+            1 => {
+                self.scoreboard.teams.remove(&name);
+            }
+            // Players joining or leaving.
+            3 | 4 => {
+                let count = r.var_int().map_err(bad)?.clamp(0, 1024);
+                let mut listed = Vec::new();
+                for _ in 0..count {
+                    listed.push(r.string(64).map_err(bad)?.to_owned());
+                }
+                let team = self.scoreboard.teams.entry(name).or_default();
+                if mode == 3 {
+                    team.members.extend(listed);
+                } else {
+                    team.members.retain(|member| !listed.contains(member));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn push_sound(&mut self, sound: Sound) {
         self.sounds.push(sound);
         // Nobody is going to hear a backlog, and an unread queue is just a leak.
@@ -992,6 +1176,11 @@ impl Session {
                 block,
             );
             self.dirty.insert(at);
+            self.changes.push((x, y, z, block));
+            // Nobody may be watching, and an unread queue is just a leak.
+            if self.changes.len() > 256 {
+                self.changes.drain(..128);
+            }
             // A block on a chunk edge changes what its neighbour can see through.
             if x.rem_euclid(16) == 0 {
                 self.dirty.insert((at.0 - 1, at.1));
@@ -1161,7 +1350,65 @@ fn bad(e: crate::Error) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_position;
+    use super::{Scoreboard, Team, decode_position};
+
+    /// A sidebar the way a lobby server builds one: an objective, a few scores, and teams
+    /// carrying the text that is actually read.
+    fn lobby() -> Scoreboard {
+        let mut board = Scoreboard::default();
+        board.titles.insert("stats".into(), "§eStatistics".into());
+        let scores = board.scores.entry("stats".into()).or_default();
+        scores.insert("Coins".into(), 12);
+        scores.insert("Rank".into(), 7);
+        scores.insert("Map".into(), 3);
+        board.sidebar = Some("stats".into());
+        board.teams.insert(
+            "t0".into(),
+            Team {
+                prefix: "§a".into(),
+                suffix: " coins".into(),
+                members: vec!["Coins".into()],
+            },
+        );
+        board
+    }
+
+    #[test]
+    fn the_sidebar_comes_out_highest_first() {
+        let (title, lines) = lobby().sidebar().expect("a sidebar");
+        assert_eq!(title, "§eStatistics");
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].1, 12);
+        assert_eq!(lines[2].1, 3);
+    }
+
+    #[test]
+    fn a_team_puts_its_prefix_and_suffix_round_a_name() {
+        let board = lobby();
+        assert_eq!(board.decorate("Coins"), "§aCoins coins");
+        assert_eq!(board.decorate("Rank"), "Rank", "not in a team");
+    }
+
+    #[test]
+    fn no_objective_on_the_sidebar_is_nothing_to_draw() {
+        let mut board = lobby();
+        board.sidebar = None;
+        assert!(board.is_empty());
+        assert!(board.sidebar().is_none());
+    }
+
+    #[test]
+    fn only_fifteen_lines_are_shown_however_many_there_are() {
+        let mut board = lobby();
+        let scores = board.scores.entry("stats".into()).or_default();
+        for n in 0..40 {
+            scores.insert(format!("entry {n}"), n);
+        }
+        let (_, lines) = board.sidebar().expect("a sidebar");
+        assert_eq!(lines.len(), 15);
+        // And they are the top fifteen, so the highest score is in there.
+        assert_eq!(lines[0].1, 39);
+    }
 
     #[test]
     fn encoding_a_position_and_decoding_it_gives_the_same_block() {

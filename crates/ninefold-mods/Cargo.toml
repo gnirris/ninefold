@@ -1,0 +1,13 @@
+[package]
+name = "ninefold-mods"
+description = "Scripted mods: hooks, a HUD to draw on, and no JVM in sight"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rhai = { version = "1.27.0", default-features = false, features = ["std", "sync"] }
+
+[lints.clippy]
+all = "deny"

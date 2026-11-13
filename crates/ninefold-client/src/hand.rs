@@ -215,10 +215,9 @@ pub struct Holding<'a> {
     /// Window width over height. The hand is placed as a fraction of what the camera can see,
     /// not at fixed coordinates, or a tall window pushes it off the side of the screen.
     pub aspect: f32,
+    /// The camera's vertical field of view, which the player can change.
+    pub fov: f32,
 }
-
-/// The camera's field of view, which has to match what the renderer projects with.
-const FOV_DEGREES: f32 = 70.0;
 
 /// How much of the way to the corner of the view the hand sits.
 const TOWARDS_CORNER: f32 = 0.62;
@@ -226,7 +225,7 @@ const TOWARDS_CORNER: f32 = 0.62;
 impl Holding<'_> {
     /// Half the width and height the camera can see at a given distance in front of it.
     fn visible(&self, depth: f32) -> (f32, f32) {
-        let half_height = depth * (FOV_DEGREES.to_radians() / 2.0).tan();
+        let half_height = depth * (self.fov.to_radians() / 2.0).tan();
         (half_height * self.aspect.max(0.1), half_height)
     }
 
@@ -374,6 +373,7 @@ mod tests {
                 swing: 0.0,
                 light: 1.0,
                 aspect: 1.78,
+                fov: 70.0,
             },
         );
         assert_eq!(sheet, Sheet::Blocks);
@@ -386,8 +386,8 @@ mod tests {
         // above the eye line, as it does in the real game, so this is about where it sits
         // overall rather than about every corner of it.
         let middle = vertices.iter().fold([0.0f32; 3], |mut sum, v| {
-            for axis in 0..3 {
-                sum[axis] += v.position[axis] / vertices.len() as f32;
+            for (axis, total) in sum.iter_mut().enumerate() {
+                *total += v.position[axis] / vertices.len() as f32;
             }
             sum
         });
@@ -410,6 +410,7 @@ mod tests {
                 swing: 0.0,
                 light: 1.0,
                 aspect: 1.78,
+                fov: 70.0,
             },
         );
         assert_eq!(sheet, Sheet::Items);
@@ -431,6 +432,7 @@ mod tests {
                     swing,
                     light: 1.0,
                     aspect: 1.78,
+                    fov: 70.0,
                 },
             )
             .0[0]
@@ -463,6 +465,7 @@ mod tests {
                     swing: 0.0,
                     light: 1.0,
                     aspect,
+                    fov: 70.0,
                 },
             );
             for v in &vertices {

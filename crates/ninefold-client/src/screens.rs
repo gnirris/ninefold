@@ -10,6 +10,7 @@ use ninefold_protocol::play::{HOTBAR_START, INVENTORY_SLOTS};
 
 use crate::font::{Font, LINE};
 use crate::gui::{self, Button, SlotArt, Ui};
+use crate::settings::Settings;
 
 /// Which screen is in front of the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +18,9 @@ pub enum Screen {
     /// Playing, nothing in the way.
     None,
     Title,
+    /// Picking a server and a name.
+    Multiplayer,
+    Options,
     Connecting,
     Pause,
     Inventory,
@@ -34,6 +38,23 @@ impl Screen {
     }
 }
 
+/// A box you can type into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    Username,
+    Server,
+}
+
+/// A setting that steps through its values when clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    Render,
+    Sensitivity,
+    Fov,
+    Volume,
+    Fullscreen,
+}
+
 /// What clicking something would do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -42,6 +63,12 @@ pub enum Action {
     Disconnect,
     Respawn,
     Quit,
+    /// Go to another screen.
+    Go(Screen),
+    /// Start typing into a box.
+    Edit(Field),
+    /// Move a setting on to its next value.
+    Step(Setting),
     /// A slot in the inventory, by its window index.
     Slot(usize),
 }
@@ -114,6 +141,8 @@ pub fn title(ui: &mut Ui, font: &Font, mouse: (f32, f32), server: &str) -> Vec<H
         100.0,
         &[
             (Action::Connect, &format!("Join {server}"), true),
+            (Action::Go(Screen::Multiplayer), "Multiplayer", true),
+            (Action::Go(Screen::Options), "Options...", true),
             (Action::Quit, "Quit Game", true),
         ],
     );
@@ -128,6 +157,122 @@ pub fn title(ui: &mut Ui, font: &Font, mouse: (f32, f32), server: &str) -> Vec<H
     let width = font.width(note);
     let (_, h) = ui.size();
     ui.text(font, note, w - width - 2.0, h - 10.0, [1.0, 1.0, 1.0, 1.0]);
+    hits
+}
+
+/// A box of text you can type into, as vanilla draws one: a pale border and a black inside.
+fn field(ui: &mut Ui, font: &Font, at: (f32, f32), text: &str, focused: bool) {
+    let (x, y) = at;
+    let width = 200.0;
+    let border = if focused {
+        [1.0, 1.0, 1.0, 1.0]
+    } else {
+        [0.63, 0.63, 0.63, 1.0]
+    };
+    ui.rect(x - 1.0, y - 1.0, width + 2.0, 22.0, border);
+    ui.rect(x, y, width, 20.0, [0.0, 0.0, 0.0, 1.0]);
+    // The end of the text is what matters while typing, so a long value scrolls rather than
+    // running past the edge of its box.
+    let mut shown = text.to_owned();
+    while font.width(&shown) > width - 12.0 && !shown.is_empty() {
+        shown.remove(0);
+    }
+    let caret = if focused { "_" } else { "" };
+    ui.text(font, &format!("{shown}{caret}"), x + 4.0, y + 6.0, [
+        0.88, 0.88, 0.88, 1.0,
+    ]);
+}
+
+/// Pick a server and a name, and go.
+///
+/// There is no account here and no session check, so the name is simply what you say it is.
+/// That works on a server running `online-mode=false` and nowhere else, which is stated on the
+/// screen rather than left for a confusing refusal later.
+pub fn multiplayer(
+    ui: &mut Ui,
+    font: &Font,
+    mouse: (f32, f32),
+    settings: &Settings,
+    focus: Option<Field>,
+) -> Vec<Hit> {
+    let (w, _) = ui.size();
+    ui.dirt();
+    ui.text_centred(font, "Play Multiplayer", w / 2.0, 20.0, [1.0, 1.0, 1.0, 1.0]);
+
+    let x = w / 2.0 - 100.0;
+    let mut hits = Vec::new();
+    for (index, (label, value, which)) in [
+        ("Server address", settings.server.as_str(), Field::Server),
+        ("Username", settings.username.as_str(), Field::Username),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let y = 50.0 + index as f32 * 42.0;
+        ui.text(font, label, x, y, [0.63, 0.63, 0.63, 1.0]);
+        field(ui, font, (x, y + 12.0), value, focus == Some(*which));
+        hits.push(Hit {
+            action: Action::Edit(*which),
+            at: (x, y + 12.0),
+            size: (200.0, 20.0),
+        });
+    }
+
+    hits.extend(buttons(
+        ui,
+        font,
+        mouse,
+        140.0,
+        &[
+            (Action::Connect, "Join Server", true),
+            (Action::Go(Screen::Title), "Back", true),
+        ],
+    ));
+    let note = "Offline mode: works on servers with online-mode=false";
+    ui.text_centred(font, note, w / 2.0, 196.0, [0.63, 0.63, 0.63, 1.0]);
+    hits
+}
+
+/// The settings, each one a button that steps on to its next value.
+pub fn options(ui: &mut Ui, font: &Font, mouse: (f32, f32), settings: &Settings) -> Vec<Hit> {
+    let (w, _) = ui.size();
+    ui.dirt();
+    ui.text_centred(font, "Options", w / 2.0, 20.0, [1.0, 1.0, 1.0, 1.0]);
+
+    let rows: [(Setting, String); 5] = [
+        (
+            Setting::Render,
+            format!("Render Distance: {} chunks", settings.render_distance),
+        ),
+        (
+            Setting::Sensitivity,
+            format!("Sensitivity: {:.0}%", settings.sensitivity / 0.3 * 100.0),
+        ),
+        (Setting::Fov, format!("FOV: {:.0}", settings.fov)),
+        (
+            Setting::Volume,
+            format!("Sound: {:.0}%", settings.volume * 100.0),
+        ),
+        (
+            Setting::Fullscreen,
+            format!(
+                "Fullscreen: {}",
+                if settings.fullscreen { "ON" } else { "OFF" }
+            ),
+        ),
+    ];
+    let listed: Vec<(Action, &str, bool)> = rows
+        .iter()
+        .map(|(setting, label)| (Action::Step(*setting), label.as_str(), true))
+        .collect();
+    let mut hits = buttons(ui, font, mouse, 44.0, &listed);
+    hits.extend(buttons(
+        ui,
+        font,
+        mouse,
+        180.0,
+        &[(Action::Go(Screen::Title), "Done", true)],
+    ));
     hits
 }
 
@@ -311,6 +456,50 @@ pub fn chat(ui: &mut Ui, font: &Font, lines: &[String], typing: Option<&str>) {
     }
 }
 
+/// The scoreboard down the right-hand side, as vanilla lays it out.
+///
+/// Right-aligned, vertically centred, with the score in red at the end of each line and a
+/// slightly darker strip behind the title. Servers lean on this heavily, so getting the
+/// alignment right is most of what makes a lobby look like itself.
+pub fn sidebar(ui: &mut Ui, font: &Font, title: &str, lines: &[(String, i32)]) {
+    if lines.is_empty() {
+        return;
+    }
+    let (w, h) = ui.size();
+    // Wide enough for the longest line, counting the gap before the score.
+    let widest = lines
+        .iter()
+        .map(|(name, score)| font.width(name) + font.width(&score.to_string()) + 8.0)
+        .fold(font.width(title), f32::max);
+    let left = w - widest - 5.0;
+    let top = h / 2.0 - lines.len() as f32 * LINE / 2.0;
+
+    ui.rect(
+        left - 2.0,
+        top - LINE - 1.0,
+        widest + 4.0,
+        LINE + 1.0,
+        [0.0, 0.0, 0.0, 0.4],
+    );
+    ui.text_centred(font, title, left + widest / 2.0, top - LINE + 1.0, [
+        1.0, 1.0, 1.0, 1.0,
+    ]);
+    ui.rect(
+        left - 2.0,
+        top,
+        widest + 4.0,
+        lines.len() as f32 * LINE,
+        [0.0, 0.0, 0.0, 0.3],
+    );
+    for (row, (name, score)) in lines.iter().enumerate() {
+        let y = top + row as f32 * LINE + 1.0;
+        ui.text(font, name, left, y, [1.0, 1.0, 1.0, 1.0]);
+        let score = score.to_string();
+        let width = font.width(&score);
+        ui.text(font, &score, left + widest - width, y, [1.0, 0.33, 0.33, 1.0]);
+    }
+}
+
 /// The readout F3 shows.
 pub fn debug(ui: &mut Ui, font: &Font, lines: &[String]) {
     for (row, line) in lines.iter().enumerate() {
@@ -381,8 +570,11 @@ mod tests {
     fn the_title_screen_has_somewhere_to_click() {
         let mut ui = Ui::new(1280, 720);
         let hits = title(&mut ui, &font(), (0.0, 0.0), "127.0.0.1:25565");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].action, Action::Connect);
+        let actions: Vec<_> = hits.iter().map(|h| h.action).collect();
+        assert_eq!(actions[0], Action::Connect, "straight in, to the last server");
+        assert!(actions.contains(&Action::Go(Screen::Multiplayer)));
+        assert!(actions.contains(&Action::Go(Screen::Options)));
+        assert!(actions.contains(&Action::Quit));
         assert!(!ui.sheet.is_empty(), "the dirt and the logo");
         assert!(!ui.text.is_empty(), "the button labels");
     }
@@ -459,6 +651,33 @@ mod tests {
     }
 
     #[test]
+    fn the_sidebar_is_right_aligned_and_stays_on_screen() {
+        let font = font();
+        let mut ui = Ui::new(1280, 720);
+        let lines: Vec<(String, i32)> = vec![
+            ("Coins".to_owned(), 1200),
+            ("Rank".to_owned(), 7),
+            ("A rather longer line than the others".to_owned(), 1),
+        ];
+        sidebar(&mut ui, &font, "Statistics", &lines);
+        assert!(!ui.text.is_empty());
+        for glyph in ui.text.iter().chain(&ui.sheet) {
+            assert!(
+                glyph.position[0] <= 1.001 && glyph.position[0] >= -1.001,
+                "{:?} is off the side",
+                glyph.position
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_sidebar_draws_nothing_at_all() {
+        let mut ui = Ui::new(1280, 720);
+        sidebar(&mut ui, &font(), "Statistics", &[]);
+        assert!(ui.text.is_empty() && ui.sheet.is_empty());
+    }
+
+    #[test]
     fn long_text_wraps_rather_than_running_off_the_screen() {
         let font = font();
         let long = "the server closed the connection because something went very wrong indeed";
@@ -490,6 +709,57 @@ mod tests {
         chat(&mut typing, &font, &[], Some("hello"));
         assert!(typing.sheet.len() > quiet.sheet.len());
         assert!(!typing.text.is_empty());
+    }
+
+    #[test]
+    fn the_multiplayer_screen_offers_both_boxes_and_a_way_in() {
+        let mut ui = Ui::new(1280, 720);
+        let settings = Settings::default();
+        let hits = multiplayer(&mut ui, &font(), (0.0, 0.0), &settings, Some(Field::Server));
+        let actions: Vec<_> = hits.iter().map(|h| h.action).collect();
+        assert!(actions.contains(&Action::Edit(Field::Server)));
+        assert!(actions.contains(&Action::Edit(Field::Username)));
+        assert!(actions.contains(&Action::Connect));
+        assert!(actions.contains(&Action::Go(Screen::Title)));
+        // Nothing overlaps, or a click would be ambiguous.
+        for (i, a) in hits.iter().enumerate() {
+            for b in &hits[i + 1..] {
+                let apart = a.at.1 + a.size.1 <= b.at.1 || b.at.1 + b.size.1 <= a.at.1;
+                let beside = a.at.0 + a.size.0 <= b.at.0 || b.at.0 + b.size.0 <= a.at.0;
+                assert!(apart || beside, "{:?} overlaps {:?}", a.action, b.action);
+            }
+        }
+    }
+
+    #[test]
+    fn every_setting_has_a_button_and_says_its_value() {
+        let mut ui = Ui::new(1280, 720);
+        let settings = Settings::default();
+        let hits = options(&mut ui, &font(), (0.0, 0.0), &settings);
+        for setting in [
+            Setting::Render,
+            Setting::Sensitivity,
+            Setting::Fov,
+            Setting::Volume,
+            Setting::Fullscreen,
+        ] {
+            assert!(
+                hits.iter().any(|h| h.action == Action::Step(setting)),
+                "{setting:?} has no button"
+            );
+        }
+        assert!(hits.iter().any(|h| h.action == Action::Go(Screen::Title)));
+    }
+
+    #[test]
+    fn a_focused_box_shows_a_caret_and_an_unfocused_one_does_not() {
+        let settings = Settings::default();
+        let count = |focus| {
+            let mut ui = Ui::new(1280, 720);
+            multiplayer(&mut ui, &font(), (0.0, 0.0), &settings, focus);
+            ui.text.len()
+        };
+        assert!(count(Some(Field::Server)) > count(None));
     }
 
     #[test]

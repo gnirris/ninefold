@@ -87,6 +87,22 @@ static BIPED: [Cuboid; 6] = [
     Cuboid::new([0.0, 0.0, -2.0], [4.0, 12.0, 2.0], [0.0, 16.0]),  // left leg
 ];
 
+/// A player, on a 1.8 skin.
+///
+/// Two things a plain biped does not have. A 64x64 skin gives the left arm and left leg regions
+/// of their own rather than mirroring the right ones, and there is a second layer over the head
+/// — the hat — drawn very slightly larger, which is where every skin's hair lives. Without it
+/// most players come out bald.
+static PLAYER: [Cuboid; 7] = [
+    Cuboid::new([-4.0, 24.0, -4.0], [4.0, 32.0, 4.0], [0.0, 0.0]), // head
+    Cuboid::new([-4.25, 23.75, -4.25], [4.25, 32.25, 4.25], [32.0, 0.0]), // hat
+    Cuboid::new([-4.0, 12.0, -2.0], [4.0, 24.0, 2.0], [16.0, 16.0]), // body
+    Cuboid::new([-8.0, 12.0, -2.0], [-4.0, 24.0, 2.0], [40.0, 16.0]), // right arm
+    Cuboid::new([4.0, 12.0, -2.0], [8.0, 24.0, 2.0], [32.0, 48.0]), // left arm
+    Cuboid::new([-4.0, 0.0, -2.0], [0.0, 12.0, 2.0], [0.0, 16.0]), // right leg
+    Cuboid::new([0.0, 0.0, -2.0], [4.0, 12.0, 2.0], [16.0, 48.0]), // left leg
+];
+
 /// A skeleton is a biped with two-pixel limbs.
 static SKELETON: [Cuboid; 6] = [
     Cuboid::new([-4.0, 24.0, -4.0], [4.0, 32.0, 4.0], [0.0, 0.0]),
@@ -144,7 +160,7 @@ static CHICKEN: [Cuboid; 5] = [
 
 static PLAYER_MODEL: Model = Model {
     texture: "entity/steve",
-    boxes: &BIPED,
+    boxes: &PLAYER,
     // Vanilla's own number: a 32-pixel model standing in a 1.8-block hitbox.
     scale: 0.9375,
 };
@@ -459,10 +475,25 @@ mod tests {
     }
 
     #[test]
+    fn a_players_left_side_is_not_a_mirror_of_their_right() {
+        // On a 64x64 skin the left limbs have regions of their own. Reusing the right ones is
+        // what makes a player with an asymmetric skin look wrong in a way nobody can name.
+        let right_arm = PLAYER[3].uv;
+        let left_arm = PLAYER[4].uv;
+        let right_leg = PLAYER[5].uv;
+        let left_leg = PLAYER[6].uv;
+        assert_ne!(right_arm, left_arm);
+        assert_ne!(right_leg, left_leg);
+        // And the hat sits just outside the head, or it would fight it for the same pixels.
+        let (head, hat) = (&PLAYER[0], &PLAYER[1]);
+        assert!(hat.from[0] < head.from[0] && hat.to[1] > head.to[1]);
+    }
+
+    #[test]
     fn a_players_face_is_where_every_skin_puts_it() {
         // The front of the head box: eight pixels in and eight down, which is the one coordinate
         // in this file that every Minecraft skin in existence depends on.
-        let head = &BIPED[0];
+        let head = &PLAYER[0];
         assert_eq!(
             Side::North.patch(head.uv, head.texture_size()),
             [8.0, 8.0, 8.0, 8.0]
@@ -485,7 +516,7 @@ mod tests {
             1.0,
             (&mut vertices, &mut indices),
         );
-        assert_eq!(indices.len(), BIPED.len() * 6 * 6, "six faces a box");
+        assert_eq!(indices.len(), PLAYER.len() * 6 * 6, "six faces a box");
         for triangle in indices.as_chunks::<3>().0 {
             let v: Vec<_> = triangle.iter().map(|i| vertices[*i as usize]).collect();
             let edge = |a: usize, b: usize| {
@@ -522,6 +553,9 @@ mod tests {
             .iter()
             .map(|v| v.position[1])
             .fold(f32::MIN, f32::max);
+        // The hat layer sticks out a quarter pixel past the head, so this is measured against
+        // the head rather than against the whole model.
+        let top = top - 0.25 / 16.0 * PLAYER_MODEL.scale;
         let bottom = vertices
             .iter()
             .map(|v| v.position[1])
@@ -533,8 +567,8 @@ mod tests {
         );
         // And within half a block of the middle on each side.
         for v in &vertices {
-            assert!((v.position[0] - 10.0).abs() <= 0.5);
-            assert!((v.position[2] + 3.0).abs() <= 0.5);
+            assert!((v.position[0] - 10.0).abs() <= 0.52);
+            assert!((v.position[2] + 3.0).abs() <= 0.52);
         }
     }
 

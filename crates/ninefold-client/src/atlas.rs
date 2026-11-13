@@ -1153,8 +1153,8 @@ impl Atlas {
             }
         };
         // The breaking animation is ten more tiles, needed by no block in particular.
-        for stage in 0..CRACK_STAGES {
-            want(Recipe::Plain(CRACK_TEXTURES[stage]), &mut order);
+        for texture in CRACK_TEXTURES {
+            want(Recipe::Plain(texture), &mut order);
         }
         for block in &blocks {
             for recipe in [block.top, block.bottom, block.side] {

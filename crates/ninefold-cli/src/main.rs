@@ -36,7 +36,10 @@ fn ping(target: &str) -> ExitCode {
             println!("{host}:{port}");
             println!("  version   {} (protocol {})", s.version, s.protocol);
             println!("  players   {}/{}", s.players_online, s.players_max);
-            println!("  latency   {} ms", s.latency.as_millis());
+            match s.latency {
+                Some(latency) => println!("  latency   {} ms", latency.as_millis()),
+                None => println!("  latency   not answered (the server ignores ping packets)"),
+            }
             for line in s.motd.lines() {
                 println!("  motd      {line}");
             }

@@ -23,8 +23,12 @@ pub struct Status {
     pub players_max: u32,
     /// The message of the day, with colour codes stripped.
     pub motd: String,
-    /// How long the server took to answer a ping.
-    pub latency: std::time::Duration,
+    /// How long the server took to answer a ping, where it answered at all.
+    ///
+    /// Plenty of proxies reply to the status request and then ignore the ping packet entirely.
+    /// That is not a failure — the status is the part anyone wanted — so this is optional
+    /// rather than a reason to throw the whole answer away.
+    pub latency: Option<std::time::Duration>,
 }
 
 #[derive(Deserialize)]
@@ -74,24 +78,13 @@ pub fn ping(host: &str, port: u16) -> io::Result<Status> {
         .to_owned();
 
     // Ping (0x01) carries any number and the server echoes it back, which is the round trip.
+    // A server that does not answer it has still told us everything else, so this waits a short
+    // while and then gives up rather than failing the ping it has already answered.
     let token = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
     let sent = Instant::now();
-    c.send(
-        0x01,
-        &body(|w| {
-            w.i64(token);
-        }),
-    )?;
-    let (id, echo) = c.recv()?;
-    let latency = sent.elapsed();
-    if id != 0x01 || crate::Reader::new(&echo).i64().ok() != Some(token) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the server did not echo the ping",
-        ));
-    }
+    let latency = measure(&mut c, token).ok().flatten().map(|()| sent.elapsed());
 
     let raw: Raw = serde_json::from_str(&json)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("status json: {e}")))?;
@@ -104,6 +97,27 @@ pub fn ping(host: &str, port: u16) -> io::Result<Status> {
         motd: motd_text(&raw.description),
         latency,
     })
+}
+
+/// Send the ping packet and wait briefly for the echo.
+///
+/// `Ok(None)` means the server ignored it, which several proxies do.
+fn measure(c: &mut Connection, token: i64) -> io::Result<Option<()>> {
+    c.send(
+        0x01,
+        &body(|w| {
+            w.i64(token);
+        }),
+    )?;
+    c.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    let answer = c.recv();
+    match answer {
+        Ok((id, echo)) if id == 0x01 && crate::Reader::new(&echo).i64().ok() == Some(token) => {
+            Ok(Some(()))
+        }
+        // Anything else, including a closed connection or a silence: no round trip to report.
+        _ => Ok(None),
+    }
 }
 
 /// Flatten a chat component — or a plain string — into readable text, colour codes removed.

@@ -59,6 +59,8 @@ pub struct Audio {
     pick: usize,
     /// How far the player has walked since the last footstep.
     walked: f64,
+    /// Everything is multiplied by this before it is played.
+    master: f32,
 }
 
 impl Audio {
@@ -72,7 +74,13 @@ impl Audio {
             clips: HashMap::new(),
             pick: 0,
             walked: 0.0,
+            master: 1.0,
         }
+    }
+
+    /// How loud everything is, 0 to 1.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.master = volume.clamp(0.0, 1.0);
     }
 
     /// Is there anything to hear?
@@ -115,7 +123,7 @@ impl Audio {
             return;
         };
         if let Some(mixer) = &self.mixer {
-            mixer.play(&clip, volume, pitch, 0.0);
+            mixer.play(&clip, volume * self.master, pitch, 0.0);
         }
     }
 
@@ -145,7 +153,7 @@ impl Audio {
             0.0
         };
         if let Some(mixer) = &self.mixer {
-            mixer.play(&clip, volume.min(1.0) * near, pitch, pan);
+            mixer.play(&clip, volume.min(1.0) * near * self.master, pitch, pan);
         }
     }
 
@@ -237,6 +245,7 @@ mod tests {
             clips: HashMap::new(),
             pick: 0,
             walked: 0.0,
+            master: 1.0,
         };
         assert!(!audio.working());
         audio.here("random.pop", 1.0, 1.0);
@@ -256,6 +265,7 @@ mod tests {
             clips: HashMap::new(),
             pick: 0,
             walked: 0.0,
+            master: 1.0,
         };
         audio.walking(5.0, 1 << 4, true);
         assert_eq!(audio.walked, 0.0, "nothing underfoot in mid air");
