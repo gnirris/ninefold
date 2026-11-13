@@ -228,6 +228,17 @@ const SKY: [f32; 3] = [0.47, 0.65, 1.0];
 /// One set of buffers with a count of indices.
 type Indexed = (wgpu::Buffer, wgpu::Buffer, u32);
 
+/// Which picture a mesh takes its pixels from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sheet {
+    /// The block atlas.
+    Blocks,
+    /// The item pictures.
+    Items,
+    /// Mob and player skins.
+    Mobs,
+}
+
 /// Everything needed to draw, tied to one window.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -250,6 +261,11 @@ pub struct Renderer {
     /// Mobs and players: the world pipeline with the mob sheet bound.
     mobs: Option<wgpu::BindGroup>,
     mob_mesh: Option<Indexed>,
+    /// Cracks on the block being broken: world geometry, block atlas, nothing special.
+    cracks: Option<Indexed>,
+    /// What is in the player's hand, drawn over everything so the world cannot bury it.
+    hand: wgpu::RenderPipeline,
+    hand_mesh: Option<(Indexed, Sheet)>,
     text: wgpu::RenderPipeline,
     font: Option<wgpu::BindGroup>,
     text_mesh: Option<(wgpu::Buffer, u32)>,
@@ -491,6 +507,43 @@ impl Renderer {
             cache: None,
         });
 
+        // The hand is the same pipeline with the depth test taken off: it lives in front of the
+        // player's face, and a wall two blocks away must not be allowed to cover it.
+        let hand = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("hand"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x3, 4 => Float32],
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(format.into())],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let depth = depth_view(&device, &config);
 
         Ok(Self {
@@ -510,6 +563,9 @@ impl Renderer {
             boxes: None,
             mobs: None,
             mob_mesh: None,
+            cracks: None,
+            hand,
+            hand_mesh: None,
             text,
             font: None,
             text_mesh: None,
@@ -656,6 +712,16 @@ impl Renderer {
     /// dozen on screen, and they all move, so a per-entity buffer would buy nothing.
     pub fn set_mobs(&mut self, vertices: &[Vertex], indices: &[u32]) {
         self.mob_mesh = indexed(&self.device, "mobs", vertices, indices);
+    }
+
+    /// The cracks spreading across the block being broken.
+    pub fn set_cracks(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        self.cracks = indexed(&self.device, "cracks", vertices, indices);
+    }
+
+    /// What the player is holding, in front of the camera, out of whichever sheet it comes from.
+    pub fn set_hand(&mut self, vertices: &[Vertex], indices: &[u32], from: Sheet) {
+        self.hand_mesh = indexed(&self.device, "hand", vertices, indices).map(|mesh| (mesh, from));
     }
 
     /// Outline the block being looked at, or nothing.
@@ -824,6 +890,16 @@ impl Renderer {
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
+            // The cracks sit on the block being broken, so they share its atlas and its pipeline.
+            if let (Some((vertices, indices, count)), Some(bind_group)) =
+                (&self.cracks, &self.bind_group)
+            {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, Some(bind_group), &[]);
+                pass.set_vertex_buffer(0, vertices.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*count, 0, 0..1);
+            }
             // Everything alive, out of its own sheet, through the same pipeline.
             if let (Some((vertices, indices, count)), Some(mobs)) = (&self.mob_mesh, &self.mobs) {
                 pass.set_pipeline(&self.pipeline);
@@ -838,6 +914,21 @@ impl Renderer {
                     pass.set_pipeline(&self.outline);
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..*count, 0..1);
+                }
+            }
+            // The hand, over the world and under the interface.
+            if let Some(((vertices, indices, count), from)) = &self.hand_mesh {
+                let sheet = match from {
+                    Sheet::Blocks => &self.bind_group,
+                    Sheet::Items => &self.items,
+                    Sheet::Mobs => &self.mobs,
+                };
+                if let Some(sheet) = sheet {
+                    pass.set_pipeline(&self.hand);
+                    pass.set_bind_group(0, Some(sheet), &[]);
+                    pass.set_vertex_buffer(0, vertices.slice(..));
+                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
             // The interface, in layers, each with its own picture bound.

@@ -314,21 +314,22 @@ impl Ui {
     }
 
     /// The tiled dirt behind the menus.
+    ///
+    /// Vanilla darkens it by drawing the tiles themselves at quarter brightness. Laying a dark
+    /// rectangle over them instead buries them: the wash is opaque, and all you get is grey.
     pub fn dirt(&mut self) {
         let (w, h) = self.size();
-        // Vanilla draws it at a quarter scale and darkened.
         let step = 32.0;
         let shade = [0.25, 0.25, 0.25, 1.0];
         let mut y = 0.0;
         while y < h {
             let mut x = 0.0;
             while x < w {
-                self.sprite_scaled(DIRT, x, y, step, step);
+                self.sprite_tinted(DIRT, x, y, step, step, shade);
                 x += step;
             }
             y += step;
         }
-        self.rect(0.0, 0.0, w, h, shade);
     }
 
     /// A line of text, with the shadow vanilla draws under it.

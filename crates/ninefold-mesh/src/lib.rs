@@ -250,44 +250,25 @@ fn push_face(
     corners_light: [f32; 4],
 ) {
     let (x, y, z) = (at.0 as f32, at.1 as f32, at.2 as f32);
-    // Corners, wound anticlockwise seen from outside, so back-face culling keeps the right ones.
+    let (x1, y1, z1) = (x + 1.0, y + 1.0, z + 1.0);
+    // Bottom left, bottom right, top right, top left — *as seen from outside the block*, which
+    // is the only ordering that puts a texture the right way up and the right way round. Getting
+    // this wrong does not stop anything rendering: it rotates the bark on a log by ninety
+    // degrees on two sides of it and mirrors it on the other two, which is exactly the kind of
+    // wrong that is easy to look straight past.
+    //
+    // Which corner is "bottom left" depends on where the viewer is. Standing north of a block
+    // and looking at its north face, world +x is on your left, so the bottom left corner is the
+    // one at maximum x — and that is why these are not simply the corners in order.
     let corners: [[f32; 3]; 4] = match face {
-        Face::Down => [
-            [x, y, z],
-            [x, y, z + 1.0],
-            [x + 1.0, y, z + 1.0],
-            [x + 1.0, y, z],
-        ],
-        Face::Up => [
-            [x, y + 1.0, z],
-            [x + 1.0, y + 1.0, z],
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x, y + 1.0, z + 1.0],
-        ],
-        Face::North => [
-            [x, y, z],
-            [x + 1.0, y, z],
-            [x + 1.0, y + 1.0, z],
-            [x, y + 1.0, z],
-        ],
-        Face::South => [
-            [x, y, z + 1.0],
-            [x, y + 1.0, z + 1.0],
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x + 1.0, y, z + 1.0],
-        ],
-        Face::West => [
-            [x, y, z],
-            [x, y + 1.0, z],
-            [x, y + 1.0, z + 1.0],
-            [x, y, z + 1.0],
-        ],
-        Face::East => [
-            [x + 1.0, y, z],
-            [x + 1.0, y, z + 1.0],
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x + 1.0, y + 1.0, z],
-        ],
+        Face::North => [[x1, y, z], [x, y, z], [x, y1, z], [x1, y1, z]],
+        Face::South => [[x, y, z1], [x1, y, z1], [x1, y1, z1], [x, y1, z1]],
+        Face::West => [[x, y, z], [x, y, z1], [x, y1, z1], [x, y1, z]],
+        Face::East => [[x1, y, z1], [x1, y, z], [x1, y1, z], [x1, y1, z1]],
+        // Seen from above with north at the top of the texture, which is how Minecraft lays out
+        // every top face.
+        Face::Up => [[x, y1, z1], [x1, y1, z1], [x1, y1, z], [x, y1, z]],
+        Face::Down => [[x, y, z], [x1, y, z], [x1, y, z1], [x, y, z1]],
     };
     let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
     let first = u32::try_from(mesh.vertices.len()).unwrap_or(u32::MAX);
@@ -301,11 +282,11 @@ fn push_face(
             light,
         });
     }
-    // Wound so that (v1-v0) x (v2-v0) points the same way as the face does, which is what
-    // back-face culling needs. Reverse these and every block is drawn inside out: the world
-    // renders, and you are looking at the undersides of it.
+    // The corners run anticlockwise seen from outside, so the two triangles are the obvious
+    // ones. Reverse them and every block is drawn inside out: the world renders, and you are
+    // looking at the undersides of it.
     mesh.indices
-        .extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
+        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
 }
 
 /// How far a crossed sprite's planes sit in from the block's edges.
@@ -357,7 +338,7 @@ fn push_quad(mesh: &mut Mesh, at: (i32, i32, i32), corners: [[f32; 3]; 4], block
         });
     }
     mesh.indices
-        .extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
+        .extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
 }
 
 #[cfg(test)]
@@ -572,6 +553,64 @@ mod tests {
             }
         }
         assert!(section(&Hidden, (0, 0, 0)).is_empty());
+    }
+
+    /// The bug this exists to catch: a face whose corners are in the wrong order still renders,
+    /// still culls correctly and still has the right texture on it — it is just rotated or
+    /// mirrored. On stone nobody can tell. On a log, the bark runs sideways.
+    #[test]
+    fn a_texture_is_the_right_way_up_and_the_right_way_round() {
+        let mesh = section(&OneBlock(0, 0, 0), (0, 0, 0));
+        for face in Face::ALL {
+            let quad: Vec<_> = mesh
+                .vertices
+                .iter()
+                .filter(|v| v.normal == face.normal())
+                .collect();
+            assert_eq!(quad.len(), 4, "{face:?} should be one quad");
+            let at = |u: f32, v: f32| {
+                quad.iter()
+                    .find(|c| c.uv == [u, v])
+                    .unwrap_or_else(|| panic!("{face:?} has no corner at uv {u},{v}"))
+                    .position
+            };
+            let (bottom_left, bottom_right, top_left) = (at(0.0, 1.0), at(1.0, 1.0), at(0.0, 0.0));
+
+            // The top of the texture is the top of the face. On the up and down faces there is
+            // no "up": the top face has north at the top of the texture, as Minecraft lays them
+            // out, and the bottom face is its mirror because you are looking at it from under.
+            match face {
+                Face::Up => assert!(
+                    top_left[2] < bottom_left[2],
+                    "the top of a top face's texture should point north"
+                ),
+                Face::Down => assert!(
+                    top_left[2] > bottom_left[2],
+                    "a bottom face is the mirror of a top one, seen from below"
+                ),
+                _ => assert!(
+                    top_left[1] > bottom_left[1],
+                    "{face:?}: the texture is upside down"
+                ),
+            }
+
+            // And u increases to the right as seen from outside the block, which is up × normal.
+            let n = face.normal();
+            let right = [
+                1.0 * n[2] - 0.0 * n[1],
+                0.0 * n[0] - 0.0 * n[2],
+                0.0 * n[1] - 1.0 * n[0],
+            ];
+            let along = [
+                bottom_right[0] - bottom_left[0],
+                bottom_right[1] - bottom_left[1],
+                bottom_right[2] - bottom_left[2],
+            ];
+            let dot = along[0] * right[0] + along[1] * right[1] + along[2] * right[2];
+            if !matches!(face, Face::Up | Face::Down) {
+                assert!(dot > 0.0, "{face:?}: the texture is mirrored ({dot})");
+            }
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@
 mod atlas;
 mod font;
 mod gui;
+mod hand;
 mod items;
 mod models;
 mod screens;
@@ -43,6 +44,8 @@ const EYE_HEIGHT: f64 = 1.62;
 const SENSITIVITY: f64 = 0.15;
 /// What the desktop knows this window as, matching `ninefold.desktop`.
 const APP_ID: &str = "ninefold";
+/// How long an arm swing lasts. Vanilla's is six ticks, and it is a recognisable six ticks.
+const SWING_TICKS: u32 = 6;
 /// How much of the way an entity is moved towards where the server says it is, per frame.
 ///
 /// The server sends an entity's position twenty times a second at best, and often less; drawing
@@ -236,8 +239,11 @@ struct App {
     debug: bool,
     /// Hitboxes, as F3+B does.
     hitboxes: bool,
-    /// The block being broken and how long it still needs.
-    breaking: Option<(raycast::Hit, f32)>,
+    /// The block being broken, how long it still needs, and how long it needed to start with —
+    /// the last of those is what turns progress into which crack picture to draw.
+    breaking: Option<(raycast::Hit, f32, f32)>,
+    /// Ticks left in the arm's swing. Vanilla swings for six.
+    swing: u32,
     /// Is the left button down?
     swinging: bool,
     /// Ticks spent breaking, so the tool taps rather than hums.
@@ -296,6 +302,7 @@ impl App {
             debug: false,
             hitboxes: false,
             breaking: None,
+            swing: 0,
             swinging: false,
             taps: 0,
             followed_teleports: 0,
@@ -315,13 +322,16 @@ impl App {
             self.server.port,
             self.server.name.clone(),
         );
+        // The error the OS gives says what went wrong and not where, and "connection refused"
+        // with no address is the least useful thing a client can tell you.
+        let shown = self.server.shown.clone();
         let (send, receive) = mpsc::channel();
         std::thread::spawn(move || {
             let outcome = ninefold_protocol::login::login(&host, port, &name)
                 .and_then(|(mut connection, _profile)| {
                     play::read_join(&mut connection).map(|joined| (connection, joined))
                 })
-                .map_err(|e| e.to_string());
+                .map_err(|e| format!("{shown}: {e}"));
             // Nobody to tell means the window has gone, which is not an error.
             let _ = send.send(outcome);
         });
@@ -470,7 +480,7 @@ impl App {
         };
         let Some(hit) = self.aimed.filter(|_| self.swinging) else {
             // Nothing aimed at, or the button is up.
-            if let Some((hit, _)) = self.breaking.take() {
+            if let Some((hit, ..)) = self.breaking.take() {
                 let _ = session.dig_cancel(hit.x, hit.y, hit.z, hit.side as u8);
             }
             return;
@@ -479,9 +489,9 @@ impl App {
         // Looking at something else now: start again on the new block.
         if self
             .breaking
-            .is_none_or(|(old, _)| (old.x, old.y, old.z) != (hit.x, hit.y, hit.z))
+            .is_none_or(|(old, ..)| (old.x, old.y, old.z) != (hit.x, hit.y, hit.z))
         {
-            if let Some((old, _)) = self.breaking.take() {
+            if let Some((old, ..)) = self.breaking.take() {
                 let _ = session.dig_cancel(old.x, old.y, old.z, old.side as u8);
             }
             let block = session.block_at(hit.x, hit.y, hit.z).unwrap_or(0);
@@ -489,22 +499,23 @@ impl App {
             let needs = if session.creative() {
                 0.0
             } else {
-                atlas::break_seconds(block)
+                atlas::break_seconds(block, session.held_item(), self.body.on_ground)
             };
             if let Err(e) = session.dig_start(hit.x, hit.y, hit.z, hit.side as u8) {
                 eprintln!("could not start digging: {e}");
                 return;
             }
-            self.breaking = Some((hit, needs));
+            self.breaking = Some((hit, needs, needs.max(0.05)));
             self.taps = 0;
         }
 
-        let Some((hit, left)) = &mut self.breaking else {
+        let Some((hit, left, _)) = &mut self.breaking else {
             return;
         };
         *left -= 1.0 / TPS as f32;
         if *left > 0.0 {
             let _ = session.swing();
+            self.swing = self.swing.max(1);
             self.taps += 1;
             // A tap every quarter second, which is roughly vanilla's own cadence.
             if self.taps.is_multiple_of(5) {
@@ -536,6 +547,7 @@ impl App {
         let Some(hit) = self.aimed else {
             // Nothing in reach: using the item is still a thing you can do.
             let _ = session.use_held();
+            self.swing = SWING_TICKS;
             return;
         };
         let held = session.held_item();
@@ -548,6 +560,7 @@ impl App {
             return;
         }
         let _ = session.swing();
+        self.swing = SWING_TICKS;
         // Show it immediately rather than waiting a round trip, the way vanilla does.
         if let Some(block) = held.and_then(ninefold_protocol::item::Slot::as_block) {
             // Never inside our own feet or head.
@@ -629,6 +642,7 @@ impl App {
             let _ = session.entity_action(if input.sprint { 3 } else { 4 });
         }
 
+        self.swing = self.swing.saturating_sub(1);
         let moved = ((self.body.x - was.0).powi(2) + (self.body.z - was.1).powi(2)).sqrt();
         let under = session
             .block_at(
@@ -721,6 +735,61 @@ impl App {
             renderer.set_mobs(&vertices, &indices);
         }
         boxes
+    }
+
+    /// The hand in front of the camera, and the cracks on whatever is being broken.
+    fn build_hand(&mut self) {
+        let facing = ninefold_render::camera::facing(self.yaw as f32, self.pitch as f32);
+        let eye = [
+            self.body.x as f32,
+            (self.body.y + EYE_HEIGHT) as f32,
+            self.body.z as f32,
+        ];
+        let basis = hand::Basis::new(eye, facing);
+        let light = self.session.as_ref().map_or(1.0, |session| {
+            f32::from(session.light_at(
+                self.body.x.floor() as i32,
+                (self.body.y + 1.0).floor() as i32,
+                self.body.z.floor() as i32,
+            )) / 15.0
+        });
+        let held = self.session.as_ref().and_then(Session::held_item);
+        // Nothing in front of the camera while a menu is up, or the hand floats over the menu.
+        let (vertices, indices, sheet) = if self.screen.modal() || self.session.is_none() {
+            (Vec::new(), Vec::new(), ninefold_render::Sheet::Blocks)
+        } else {
+            hand::held(
+                &basis,
+                &hand::Holding {
+                    atlas: &self.art.atlas,
+                    items: &self.art.items,
+                    skin: self.art.mobs.placed.get("entity/steve").copied(),
+                    held,
+                    swing: 1.0 - self.swing as f32 / SWING_TICKS as f32,
+                    light,
+                    aspect: self.size.0 as f32 / self.size.1.max(1) as f32,
+                },
+            )
+        };
+
+        // How far through the block is: ten pictures, and the last of them means almost gone.
+        let cracks = match self.breaking {
+            Some((hit, left, total)) if total > 0.0 => {
+                let through = (1.0 - (left / total).clamp(0.0, 1.0))
+                    * crate::atlas::CRACK_STAGES as f32;
+                hand::cracks(
+                    &self.art.atlas,
+                    (hit.x, hit.y, hit.z),
+                    (through as usize).min(crate::atlas::CRACK_STAGES - 1),
+                )
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_hand(&vertices, &indices, sheet);
+            renderer.set_cracks(&cracks.0, &cracks.1);
+        }
     }
 
     /// What F3 shows.
@@ -1147,8 +1216,11 @@ impl ApplicationHandler for App {
                     match button {
                         MouseButton::Left => {
                             self.swinging = pressed;
+                            if pressed {
+                                self.swing = SWING_TICKS;
+                            }
                             if !pressed
-                                && let Some((hit, _)) = self.breaking.take()
+                                && let Some((hit, ..)) = self.breaking.take()
                                 && let Some(session) = self.session.as_mut()
                                 && let Err(e) =
                                     session.dig_cancel(hit.x, hit.y, hit.z, hit.side as u8)
@@ -1304,6 +1376,7 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.set_boxes(&boxes);
         }
+        self.build_hand();
 
         // One line, once, so a run with no window to look at still says whether it worked.
         if !self.announced
@@ -1320,6 +1393,7 @@ impl App {
                 session.entities.len(),
                 session.sky_brightness()
             );
+
         }
 
         self.frames += 1;

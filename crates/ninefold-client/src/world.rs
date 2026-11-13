@@ -113,7 +113,7 @@ pub fn column(session: &Session, atlas: &Atlas, at: (i32, i32)) -> (Vec<Vertex>,
 fn push(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, quad: [Vertex; 4]) {
     let first = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
     vertices.extend_from_slice(&quad);
-    indices.extend_from_slice(&[first, first + 2, first + 1, first, first + 3, first + 2]);
+    indices.extend_from_slice(&[first, first + 1, first + 2, first, first + 2, first + 3]);
 }
 
 #[cfg(test)]
@@ -135,10 +135,10 @@ mod tests {
         // The corner order the mesher emits for a north-facing quad, which is the order the
         // index list below is written for.
         let quad = [
-            corner([0.0, 0.0, 0.0]),
             corner([1.0, 0.0, 0.0]),
-            corner([1.0, 1.0, 0.0]),
+            corner([0.0, 0.0, 0.0]),
             corner([0.0, 1.0, 0.0]),
+            corner([1.0, 1.0, 0.0]),
         ];
         let (mut vertices, mut indices) = (Vec::new(), Vec::new());
         push(&mut vertices, &mut indices, quad);

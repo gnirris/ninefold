@@ -4,7 +4,7 @@ Version=1.5
 Name=ninefold
 GenericName=Minecraft 1.8.9 client
 Comment=Minecraft Java Edition 1.8.9, rewritten in Rust
-Exec=@BINARY@
+Exec=@BINARY@ @SERVER@
 Icon=ninefold
 Terminal=false
 Categories=Game;ActionGame;
@@ -14,5 +14,5 @@ StartupWMClass=ninefold
 Actions=Local;
 
 [Desktop Action Local]
-Name=Join the usual server
+Name=Join straight away
 Exec=@BINARY@ @SERVER@ --join

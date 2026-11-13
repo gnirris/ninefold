@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use ninefold_assets::{AssetSource, Texture};
 use ninefold_mesh::{Face, Shape};
+use ninefold_protocol::item::Slot;
 
 /// Plains colours, for when the colour maps cannot be read.
 const FALLBACK_GRASS: [f32; 3] = [
@@ -981,6 +982,20 @@ fn blocks() -> Vec<Block> {
     ]
 }
 
+/// The ten pictures of a block part-way to broken, in order.
+const CRACK_TEXTURES: [&str; CRACK_STAGES] = [
+    "blocks/destroy_stage_0",
+    "blocks/destroy_stage_1",
+    "blocks/destroy_stage_2",
+    "blocks/destroy_stage_3",
+    "blocks/destroy_stage_4",
+    "blocks/destroy_stage_5",
+    "blocks/destroy_stage_6",
+    "blocks/destroy_stage_7",
+    "blocks/destroy_stage_8",
+    "blocks/destroy_stage_9",
+];
+
 /// Blocks that fill their cube and hide whatever is behind them.
 ///
 /// Stated this way round on purpose. The list of things that *are* a solid cube is short and
@@ -1116,8 +1131,13 @@ pub struct Atlas {
     overlays: HashMap<(u16, Option<u8>), ([f32; 4], Tint)>,
     grass: [[f32; 3]; 256],
     foliage: [[f32; 3]; 256],
+    /// The ten stages of a block coming apart.
+    cracks: Vec<[f32; 4]>,
     missing: [f32; 4],
 }
+
+/// How many pictures there are of a block part-way to broken.
+pub const CRACK_STAGES: usize = 10;
 
 impl Atlas {
     /// Build it from whatever the asset source can provide.
@@ -1132,6 +1152,10 @@ impl Atlas {
                 order.push(recipe);
             }
         };
+        // The breaking animation is ten more tiles, needed by no block in particular.
+        for stage in 0..CRACK_STAGES {
+            want(Recipe::Plain(CRACK_TEXTURES[stage]), &mut order);
+        }
         for block in &blocks {
             for recipe in [block.top, block.bottom, block.side] {
                 match recipe {
@@ -1210,6 +1234,10 @@ impl Atlas {
             overlays,
             grass: biome_colours(assets, Tint::Grass),
             foliage: biome_colours(assets, Tint::Foliage),
+            cracks: CRACK_TEXTURES
+                .iter()
+                .filter_map(|name| at.get(&Recipe::Plain(name)).copied())
+                .collect(),
             missing: rect(mx, my, width, height),
         }
     }
@@ -1259,6 +1287,12 @@ impl Atlas {
             .get(&(id, Some(meta)))
             .or_else(|| self.overlays.get(&(id, None)))
             .copied()
+    }
+
+    /// Where stage `n` of the breaking animation samples from.
+    #[must_use]
+    pub fn crack(&self, stage: usize) -> Option<[f32; 4]> {
+        self.cracks.get(stage).copied()
     }
 
     /// What colour a tint is in a given biome.
@@ -1323,32 +1357,135 @@ fn blit(atlas: &mut [u8], atlas_width: u32, x: u32, y: u32, tile: &Texture) {
     }
 }
 
-/// How long a block takes to break by hand, in seconds, on a 1.8 server.
+/// What a tool is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    Pickaxe,
+    Axe,
+    Shovel,
+    Shears,
+    Sword,
+}
+
+/// What is in the player's hand, as far as breaking a block is concerned.
 ///
-/// Vanilla works it out from the block's hardness: without a tool that helps, breaking takes
-/// `hardness * 5` seconds, and `hardness * 1.5` when the tool is right for the job. These are
-/// the bare-hand times, which is what this client has until it has an inventory.
-///
-/// It matters because the server times the dig itself and throws away a "finished" that arrives
-/// too early — which is exactly why sending start and finish together broke nothing at all.
+/// The tier is 1.8's harvest level: wood and gold 0, stone 1, iron 2, diamond 3. Gold is the
+/// fastest tool in the game and the worst at actually harvesting anything, which is why speed
+/// and tier are separate numbers.
 #[must_use]
-pub fn break_seconds(block: u16) -> f32 {
-    let hardness = match block >> 4 {
-        // Instant.
-        0 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 175 => 0.0,
-        78 => 0.1,                                     // snow layer
-        18 | 161 => 0.2,                               // leaves
-        2 | 3 | 12 | 13 | 60 => 0.6,                   // grass, dirt, sand, gravel, farmland
-        79 | 174 => 0.5,                               // ice
-        17 | 162 | 5 | 47 | 85 => 2.0,                 // wood
-        1 | 4 | 48 | 98 | 24 | 45 => 2.0,              // stone and its kin
-        14 | 15 | 16 | 21 | 56 | 73 | 74 | 129 => 3.0, // ores
-        41 | 42 | 57 | 22 => 5.0,                      // metal and gem blocks
-        49 => 50.0,                                    // obsidian
-        7 => f32::INFINITY,                            // bedrock
+pub fn tool_of(item: Option<Slot>) -> Option<(Tool, u8, f32)> {
+    let id = item?.id;
+    let kind = match id {
+        256 | 269 | 273 | 277 | 284 => Tool::Shovel,
+        257 | 270 | 274 | 278 | 285 => Tool::Pickaxe,
+        258 | 271 | 275 | 279 | 286 => Tool::Axe,
+        359 => Tool::Shears,
+        267 | 268 | 272 | 276 | 283 => Tool::Sword,
+        _ => return None,
+    };
+    // Material, by the id's place in each tool's run: wood, stone, iron, diamond, gold.
+    let (tier, speed) = match id {
+        268..=271 => (0, 2.0),   // wood
+        272..=275 => (1, 4.0),   // stone
+        256..=258 | 267 => (2, 6.0), // iron
+        276..=279 => (3, 8.0),   // diamond
+        283..=286 => (0, 12.0),  // gold: quick, and harvests almost nothing
+        359 => (0, 5.0),         // shears
+        _ => (0, 1.0),
+    };
+    Some((kind, tier, speed))
+}
+
+/// Which tool speeds a block up, and what tier is needed to get anything out of it.
+///
+/// `None` means bare hands are enough — which is most of the world. The second number only
+/// matters where a tool is required: mining stone with a wooden pickaxe works, mining diamond
+/// ore with one gives you nothing and takes just as long.
+fn block_tool(block: u16) -> (Option<Tool>, Option<u8>) {
+    // Most specific first: a match takes the first arm that fits, and "any pickaxe" would
+    // otherwise swallow the ores that need a better one.
+    match block >> 4 {
+        // Obsidian, and nothing else, wants diamond.
+        49 => (Some(Tool::Pickaxe), Some(3)),
+        // Gold, diamond, redstone and emerald want iron.
+        14 | 41 | 56 | 57 | 73 | 74 | 129 | 133 => (Some(Tool::Pickaxe), Some(2)),
+        // Iron and lapis want stone.
+        15 | 21 | 22 | 42 => (Some(Tool::Pickaxe), Some(1)),
+        // Everything else mineral comes out with any pickaxe at all.
+        1 | 4 | 16 | 24 | 43..=45 | 48 | 52 | 67 | 87 | 98 | 108 | 109 | 112 | 114 | 121 | 128
+        | 139 | 152 | 153 | 155 | 156 | 168 | 173 | 179 | 180 => (Some(Tool::Pickaxe), Some(0)),
+        // Wood: an axe helps, hands still work.
+        5 | 17 | 47 | 53 | 54 | 58 | 63..=65 | 72 | 84 | 85 | 96 | 107 | 125 | 126 | 134..=136
+        | 146 | 162..=164 => (Some(Tool::Axe), None),
+        // Dirt: a shovel helps, hands still work.
+        2 | 3 | 12 | 13 | 60 | 78 | 79 | 80 | 82 | 88 | 110 => (Some(Tool::Shovel), None),
+        // Wool and leaves come apart fastest with shears.
+        18 | 30 | 35 | 161 => (Some(Tool::Shears), None),
+        _ => (None, None),
+    }
+}
+
+/// A block's hardness, as 1.8 lists it. Negative means it cannot be broken at all.
+fn hardness(block: u16) -> f32 {
+    match block >> 4 {
+        0 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 104 | 105 | 141 | 142 | 175 | 6 => 0.0,
+        30 => 4.0,                       // cobweb
+        78 => 0.1,                       // snow layer
+        18 | 161 => 0.2,                 // leaves
+        50 | 76 | 55 | 63 | 68 => 0.0,   // torches, redstone, signs
+        35 | 171 => 0.8,                 // wool and carpet
+        2 | 110 => 0.6,                  // grass and mycelium
+        3 | 12 | 13 | 60 | 80 | 82 => 0.5, // dirt, sand, gravel, clay
+        79 | 174 => 0.5,                 // ice
+        5 | 47 | 85 | 107 | 53 | 134..=136 | 163 | 164 => 2.0, // planks and what is made of them
+        17 | 162 => 2.0,                 // logs
+        1 | 4 | 48 | 98 | 24 | 45 | 43 | 44 | 67 | 139 | 155 | 168 | 179 => 2.0,
+        14 | 15 | 16 | 21 | 56 | 73 | 74 | 129 | 153 => 3.0, // ores
+        41 | 42 | 57 | 22 | 133 | 152 => 5.0,                // metal and gem blocks
+        87 => 0.4,                       // netherrack
+        88 => 0.5,                       // soul sand
+        89 => 0.3,                       // glowstone
+        20 | 95 | 102 => 0.3,            // glass
+        49 => 50.0,                      // obsidian
+        7 => -1.0,                       // bedrock
+        _ => 1.0,
+    }
+}
+
+/// How long this block takes to break, in seconds, with this in hand.
+///
+/// 1.8's own arithmetic, which is not "hardness times five": a block you can harvest takes
+/// `hardness * 30 / speed` ticks, and one you cannot takes `hardness * 100 / speed`. Bare hands
+/// are speed 1. Using the wrong rule makes dirt take three seconds instead of nine tenths of
+/// one, which does not read as a slow client — it reads as breaking being broken.
+#[must_use]
+pub fn break_seconds(block: u16, held: Option<Slot>, on_ground: bool) -> f32 {
+    let hardness = hardness(block);
+    if hardness < 0.0 {
+        return f32::INFINITY;
+    }
+    if hardness == 0.0 {
+        return 0.0;
+    }
+    let (wants, needs_tier) = block_tool(block);
+    let holding = tool_of(held);
+    let mut speed = match (wants, holding) {
+        (Some(wants), Some((kind, _, speed))) if kind == wants => speed,
         _ => 1.0,
     };
-    if hardness == 0.0 { 0.0 } else { hardness * 5.0 }
+    // Swinging in mid-air is five times slower, which is why you land before you mine.
+    if !on_ground {
+        speed /= 5.0;
+    }
+    let harvests = match needs_tier {
+        None => true,
+        Some(needed) => matches!(
+            (wants, holding),
+            (Some(wants), Some((kind, tier, _))) if kind == wants && tier >= needed
+        ),
+    };
+    let ticks = hardness * if harvests { 30.0 } else { 100.0 } / speed;
+    ticks / 20.0
 }
 
 #[cfg(test)]
@@ -1515,10 +1652,51 @@ mod tests {
     }
 
     #[test]
-    fn breaking_times_are_the_bare_handed_ones() {
-        assert_eq!(break_seconds(0), 0.0, "air");
-        assert_eq!(break_seconds(2 << 4), 3.0, "a grass block by hand");
-        assert!(break_seconds(7 << 4).is_infinite(), "bedrock");
-        assert!(break_seconds(49 << 4) > 200.0, "obsidian, pointlessly");
+    fn breaking_times_match_the_numbers_the_game_is_known_for() {
+        let hand = |block| break_seconds(block, None, true);
+        assert_eq!(hand(0), 0.0, "air");
+        assert!(hand(7 << 4).is_infinite(), "bedrock");
+        assert_eq!(hand(37 << 4), 0.0, "a flower comes out instantly");
+        // Dirt by hand is nine tenths of a second, not three seconds.
+        assert!(
+            (hand(3 << 4) - 0.75).abs() < 0.01,
+            "dirt by hand took {}s",
+            hand(3 << 4)
+        );
+        // Stone by hand is the famous slog, because a pickaxe is required.
+        assert!(
+            (hand(1 << 4) - 10.0).abs() < 0.1,
+            "stone by hand took {}s",
+            hand(1 << 4)
+        );
+    }
+
+    #[test]
+    fn the_right_tool_is_faster_and_the_wrong_one_is_not() {
+        let with = |block, item| break_seconds(block, Some(Slot::new(item, 1)), true);
+        let stone = 1 << 4;
+        let wood_pick = with(stone, 270);
+        let diamond_pick = with(stone, 278);
+        let shovel = with(stone, 277);
+        assert!(wood_pick < 2.0, "a wooden pickaxe on stone: {wood_pick}s");
+        assert!(diamond_pick < wood_pick, "diamond is faster than wood");
+        assert!(
+            (shovel - break_seconds(stone, None, true)).abs() < 0.01,
+            "a shovel is no help at all on stone"
+        );
+        // A pickaxe that cannot harvest the block is still slow, however fast the tool is.
+        let gold_on_diamond_ore = with(56 << 4, 285);
+        let iron_on_diamond_ore = with(56 << 4, 257);
+        assert!(
+            gold_on_diamond_ore > iron_on_diamond_ore,
+            "gold is quick and harvests nothing: {gold_on_diamond_ore}s vs {iron_on_diamond_ore}s"
+        );
+    }
+
+    #[test]
+    fn swinging_in_mid_air_is_five_times_slower() {
+        let ground = break_seconds(3 << 4, None, true);
+        let air = break_seconds(3 << 4, None, false);
+        assert!((air / ground - 5.0).abs() < 0.01, "{air}s against {ground}s");
     }
 }

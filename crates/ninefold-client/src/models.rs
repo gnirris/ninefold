@@ -364,6 +364,19 @@ pub struct Placed {
     pub sheet: [f32; 2],
 }
 
+impl Placed {
+    /// One patch of this texture, in its own pixels, as a rectangle of the whole sheet.
+    #[must_use]
+    pub fn patch(self, at: [f32; 2], size: [f32; 2]) -> [f32; 4] {
+        [
+            (self.at[0] + at[0]) / self.sheet[0],
+            (self.at[1] + at[1]) / self.sheet[1],
+            size[0] / self.sheet[0],
+            size[1] / self.sheet[1],
+        ]
+    }
+}
+
 /// Add one model to a mesh, standing at `position`, turned to `yaw`.
 pub fn build(
     model: &Model,
